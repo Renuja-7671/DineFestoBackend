@@ -1,0 +1,334 @@
+// Data Source Configuration
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// --------------------------------------
+// 1. User Management (Inheritance Logic)
+// --------------------------------------
+
+enum Role {
+  ADMIN
+  MANAGER
+  WAITER
+  CHEF
+  CUSTOMER
+}
+
+model User {
+  userId        Int       @id @default(autoincrement())
+  email         String    @unique
+  passwordHash  String
+  role          Role      @default(CUSTOMER)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // Password reset fields
+  resetToken       String?
+  resetTokenExpiry DateTime?
+
+  // 1:1 Relations to specific profiles
+  customerProfile Customer?
+  employeeProfile Employee?
+
+  // Shared relations (e.g., Notifications)
+  notifications Notification[]
+  settings      UserSettings?
+  securityLogs  SecurityLog[]
+}
+
+model Customer {
+  customerId    Int     @id @default(autoincrement())
+  user          User    @relation(fields: [userId], references: [userId])
+  userId        Int     @unique
+  fullName      String
+  phoneNumber   String?
+  loyaltyPoints Int     @default(0)
+
+  // Relations
+  orders        Order[]
+  reservations  Reservation[]
+  reviews       Review[]
+}
+
+model Employee {
+  employeeId    Int      @id @default(autoincrement())
+  user          User     @relation(fields: [userId], references: [userId])
+  userId        Int      @unique
+  fullName      String
+  contact       String?  // Phone number or contact information
+  designation   String   // e.g., "Head Chef", "Senior Waiter"
+  salary        Decimal  @db.Decimal(10, 2)
+  joinDate      DateTime @default(now())
+
+  // Relations
+  ordersProcessed Order[]         // Orders this employee managed
+  attendance      Attendance[]
+  leaveRequests   LeaveRequest[]
+}
+
+// --------------------------------------
+// 2. Menu & Inventory System
+// --------------------------------------
+
+model Category {
+  categoryId  Int        @id @default(autoincrement())
+  name        String     @unique
+  description String?
+  menuItems   MenuItem[]
+}
+
+model MenuItem {
+  itemId      Int      @id @default(autoincrement())
+  category    Category @relation(fields: [categoryId], references: [categoryId])
+  categoryId  Int
+  name        String
+  description String?
+  price       Decimal  @db.Decimal(10, 2)
+  imageUrl    String?
+  isAvailable Boolean  @default(true)
+  
+  // Relations
+  orderItems  OrderItem[]
+  recipe      RecipeIngredient[] // Link to inventory
+  reviews     Review[]
+}
+
+model InventoryItem {
+  inventoryId   Int      @id @default(autoincrement())
+  itemName      String   @unique
+  quantity      Decimal  @db.Decimal(10, 2) // Current stock
+  unit          String   // e.g., "kg", "liters", "units"
+  reorderLevel  Decimal  @db.Decimal(10, 2) // Threshold for low stock alert
+  costPerUnit   Decimal  @db.Decimal(10, 2)
+  lastUpdated   DateTime @updatedAt
+
+  // Relations
+  usedInRecipes RecipeIngredient[]
+}
+
+// Many-to-Many Link: Defines how much inventory is needed for one Menu Item
+model RecipeIngredient {
+  recipeId     Int           @id @default(autoincrement())
+  menuItem     MenuItem      @relation(fields: [menuItemId], references: [itemId])
+  menuItemId   Int
+  inventory    InventoryItem @relation(fields: [inventoryId], references: [inventoryId])
+  inventoryId  Int
+  quantityUsed Decimal       @db.Decimal(10, 3) // Amount deducted per order
+}
+
+// --------------------------------------
+// 3. Order Management System
+// --------------------------------------
+
+enum OrderStatus {
+  PENDING
+  PREPARING
+  READY
+  SERVED
+  COMPLETED
+  CANCELLED
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEAWAY
+  ONLINE_DELIVERY
+}
+
+model Order {
+  orderId       Int         @id @default(autoincrement())
+  customer      Customer?   @relation(fields: [customerId], references: [customerId])
+  customerId    Int?        // Nullable for "Walk-in" guests without accounts
+  staff         Employee?   @relation(fields: [staffId], references: [employeeId])
+  staffId       Int?        // Who processed the order
+  
+  // Guest customer information (for walk-in customers without accounts)
+  guestName     String?     // Name of walk-in customer
+  guestPhone    String?     // Phone of walk-in customer
+  
+  status        OrderStatus @default(PENDING)
+  type          OrderType   @default(DINE_IN)
+  tableNumber   Int?
+  totalAmount   Decimal     @db.Decimal(10, 2)
+  createdAt     DateTime    @default(now())
+
+  // Relations
+  items         OrderItem[]
+  payment       Payment?
+}
+
+model OrderItem {
+  orderItemId   Int      @id @default(autoincrement())
+  order         Order    @relation(fields: [orderId], references: [orderId])
+  orderId       Int
+  menuItem      MenuItem @relation(fields: [menuItemId], references: [itemId])
+  menuItemId    Int
+  quantity      Int
+  unitPrice     Decimal  @db.Decimal(10, 2) // Snapshot of price at time of order
+  customization String?  // e.g., "No onions", "Extra spicy"
+}
+
+// --------------------------------------
+// 4. Billing & Payments
+// --------------------------------------
+
+enum PaymentMethod {
+  CASH
+  CREDIT_CARD
+  ONLINE
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+model Payment {
+  paymentId     Int           @id @default(autoincrement())
+  order         Order         @relation(fields: [orderId], references: [orderId])
+  orderId       Int           @unique
+  amount        Decimal       @db.Decimal(10, 2)
+  method        PaymentMethod
+  status        PaymentStatus @default(PENDING)
+  transactionId String?       // From Stripe/Gateway
+  paidAt        DateTime      @default(now())
+}
+
+// --------------------------------------
+// 5. HR Management
+// --------------------------------------
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  HALF_DAY
+}
+
+model Attendance {
+  attendanceId Int              @id @default(autoincrement())
+  employee     Employee         @relation(fields: [employeeId], references: [employeeId])
+  employeeId   Int
+  date         DateTime         @default(now()) @db.Date
+  checkInTime  DateTime?
+  checkOutTime DateTime?
+  status       AttendanceStatus
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model LeaveRequest {
+  leaveId      Int         @id @default(autoincrement())
+  employee     Employee    @relation(fields: [employeeId], references: [employeeId])
+  employeeId   Int
+  startDate    DateTime
+  endDate      DateTime
+  reason       String
+  status       LeaveStatus @default(PENDING)
+  adminComment String?
+  appliedAt    DateTime    @default(now())
+}
+
+// --------------------------------------
+// 6. Additional Features
+// --------------------------------------
+
+model Reservation {
+  reservationId   Int      @id @default(autoincrement())
+  customer        Customer @relation(fields: [customerId], references: [customerId])
+  customerId      Int
+  tableNumber     Int
+  reservationTime DateTime
+  guestCount      Int
+  status          String   @default("CONFIRMED") // CONFIRMED, CANCELLED, PENDING, SEATED, COMPLETED, NO_SHOW
+}
+
+model Review {
+  reviewId    Int      @id @default(autoincrement())
+  customer    Customer @relation(fields: [customerId], references: [customerId])
+  customerId  Int
+  menuItem    MenuItem @relation(fields: [menuItemId], references: [itemId])
+  menuItemId  Int
+  rating      Int      // 1-5 Stars
+  comment     String?
+  createdAt   DateTime @default(now())
+}
+
+model Notification {
+  notificationId Int      @id @default(autoincrement())
+  user           User     @relation(fields: [userId], references: [userId])
+  userId         Int
+  message        String
+  isRead         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+}
+
+// --------------------------------------
+// 9. Settings & Security
+// --------------------------------------
+
+model UserSettings {
+  id                        Int      @id @default(autoincrement())
+  user                      User     @relation(fields: [userId], references: [userId])
+  userId                    Int      @unique
+  emailNotifications        Boolean  @default(true)
+  pushNotifications         Boolean  @default(true)
+  orderNotifications        Boolean  @default(true)
+  reservationNotifications  Boolean  @default(true)
+  reviewNotifications       Boolean  @default(true)
+  marketingEmails           Boolean  @default(false)
+  theme                     String   @default("light")
+  language                  String   @default("en")
+  timezone                  String   @default("UTC")
+  currency                  String   @default("LKR")
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+}
+
+model SystemSettings {
+  id                        Int      @id @default(autoincrement())
+  restaurantName            String   @default("Restaurant Management System")
+  restaurantEmail           String   @default("contact@restaurant.com")
+  restaurantPhone           String   @default("+1234567890")
+  restaurantAddress         String   @default("123 Main Street")
+  currency                  String   @default("LKR")
+  timezone                  String   @default("UTC")
+  taxRate                   Float    @default(10.0)
+  serviceChargeRate         Float    @default(5.0)
+  orderPrefix               String   @default("ORD")
+  reservationDuration       Int      @default(120)
+  maxGuestsPerReservation   Int      @default(10)
+  advanceReservationDays    Int      @default(30)
+  enableOnlineOrdering      Boolean  @default(true)
+  enableReservations        Boolean  @default(true)
+  enableReviews             Boolean  @default(true)
+  enableLoyaltyProgram      Boolean  @default(true)
+  loyaltyPointsPerDollar    Int      @default(1)
+  maintenanceMode           Boolean  @default(false)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+}
+
+model SecurityLog {
+  id          Int      @id @default(autoincrement())
+  user        User?    @relation(fields: [userId], references: [userId])
+  userId      Int?
+  action      String
+  ipAddress   String?
+  userAgent   String?
+  status      String
+  details     String?
+  createdAt   DateTime @default(now())
+}
