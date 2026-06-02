@@ -1,5 +1,72 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
+const stripeService = require('../services/stripe.service');
+
+const RESERVATION_AMOUNT_PER_GUEST = Number(process.env.RESERVATION_AMOUNT_PER_GUEST || 1000);
+const ACTIVE_RESERVATION_STATUSES = ['PENDING', 'CONFIRMED', 'SEATED'];
+
+const roundMoney = value => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+
+const calculateReservationAmounts = guestCount => {
+  const reservationAmount = roundMoney(guestCount * RESERVATION_AMOUNT_PER_GUEST);
+  const onlinePaymentAmount = roundMoney(reservationAmount / 2);
+  const remainingAmount = roundMoney(reservationAmount - onlinePaymentAmount);
+
+  return {
+    reservationAmount,
+    onlinePaymentAmount,
+    remainingAmount,
+  };
+};
+
+const resolveCustomerId = async (req, customerIdFromBody) => {
+  if (req.user.role === 'CUSTOMER') {
+    if (!req.user.customerProfile || !req.user.customerProfile.customerId) {
+      throw new Error('Customer profile not found');
+    }
+
+    return req.user.customerProfile.customerId;
+  }
+
+  return customerIdFromBody ? parseInt(customerIdFromBody) : null;
+};
+
+const findAvailableTableNumber = async (reservationDateTime, requestedTableNumber = null) => {
+  const twoHoursBefore = new Date(reservationDateTime.getTime() - 2 * 60 * 60 * 1000);
+  const twoHoursAfter = new Date(reservationDateTime.getTime() + 2 * 60 * 60 * 1000);
+
+  const isTableAvailable = async tableNumber => {
+    const existingReservation = await prisma.reservation.findFirst({
+      where: {
+        tableNumber,
+        status: {
+          in: ACTIVE_RESERVATION_STATUSES,
+        },
+        reservationTime: {
+          gte: twoHoursBefore,
+          lte: twoHoursAfter,
+        },
+      },
+    });
+
+    return !existingReservation;
+  };
+
+  if (requestedTableNumber) {
+    const parsedTableNumber = parseInt(requestedTableNumber);
+    if (await isTableAvailable(parsedTableNumber)) {
+      return parsedTableNumber;
+    }
+  }
+
+  for (let tableNumber = 1; tableNumber <= 20; tableNumber += 1) {
+    if (await isTableAvailable(tableNumber)) {
+      return tableNumber;
+    }
+  }
+
+  throw new Error('No tables are available for the selected time slot');
+};
 
 // Get all reservations
 exports.getAllReservations = async (req, res) => {
@@ -117,27 +184,24 @@ exports.getReservationById = async (req, res) => {
 // Create new reservation
 exports.createReservation = async (req, res) => {
   try {
-    let { customerId, tableNumber, reservationTime, guestCount, numberOfGuests, specialRequests } = req.body;
+    let { customerId, tableNumber, reservationTime, guestCount, numberOfGuests } = req.body;
 
     // Accept both guestCount (legacy) and numberOfGuests (current API)
-    const guests = numberOfGuests || guestCount;
-
-    // If user is a CUSTOMER, use their customerId (ignore any customerId in body)
-    if (req.user.role === 'CUSTOMER') {
-      if (!req.user.customerProfile || !req.user.customerProfile.customerId) {
-        return res.status(400).json({
-          success: false,
-          message: 'Customer profile not found',
-        });
-      }
-      customerId = req.user.customerProfile.customerId;
-    }
+    const guests = parseInt(numberOfGuests || guestCount);
+    customerId = await resolveCustomerId(req, customerId);
 
     // Validate required fields
     if (!customerId || !reservationTime || !guests) {
       return res.status(400).json({
         success: false,
         message: 'Reservation time and guest count are required',
+      });
+    }
+
+    if (guests <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Guest count must be at least 1',
       });
     }
 
@@ -153,61 +217,29 @@ exports.createReservation = async (req, res) => {
       });
     }
 
-    // Auto-assign table if not provided (for customers)
-    // Admins can manually specify a table
-    if (!tableNumber) {
-      // Simple auto-assignment: find first available table
-      // In a real system, this would be more sophisticated
-      tableNumber = Math.floor(Math.random() * 20) + 1; // Tables 1-20
-    }
-
-    // Check if table is already reserved at that time (within 2 hours window)
     const reservationDateTime = new Date(reservationTime);
-    const twoHoursBefore = new Date(reservationDateTime.getTime() - 2 * 60 * 60 * 1000);
-    const twoHoursAfter = new Date(reservationDateTime.getTime() + 2 * 60 * 60 * 1000);
 
-    const existingReservation = await prisma.reservation.findFirst({
-      where: {
-        tableNumber: parseInt(tableNumber),
-        status: {
-          in: ['PENDING', 'CONFIRMED', 'SEATED'],
-        },
-        reservationTime: {
-          gte: twoHoursBefore,
-          lte: twoHoursAfter,
-        },
-      },
-    });
-
-    if (existingReservation) {
-      // Try to find another available table
-      for (let i = 1; i <= 20; i++) {
-        const tableCheck = await prisma.reservation.findFirst({
-          where: {
-            tableNumber: i,
-            status: {
-              in: ['PENDING', 'CONFIRMED', 'SEATED'],
-            },
-            reservationTime: {
-              gte: twoHoursBefore,
-              lte: twoHoursAfter,
-            },
-          },
-        });
-        if (!tableCheck) {
-          tableNumber = i;
-          break;
-        }
-      }
+    if (Number.isNaN(reservationDateTime.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reservation time',
+      });
     }
+
+    const assignedTableNumber = await findAvailableTableNumber(reservationDateTime, tableNumber);
+    const { reservationAmount } = calculateReservationAmounts(guests);
 
     const reservation = await prisma.reservation.create({
       data: {
         customerId: parseInt(customerId),
-        tableNumber: parseInt(tableNumber),
-        reservationTime: new Date(reservationTime),
-        guestCount: parseInt(guests),
+        tableNumber: assignedTableNumber,
+        reservationTime: reservationDateTime,
+        guestCount: guests,
         status: 'PENDING', // Start as PENDING, admin can confirm
+        reservationAmount,
+        onlinePaidAmount: 0,
+        remainingAmount: reservationAmount,
+        paymentStatus: 'PENDING',
       },
       include: {
         customer: {
@@ -225,9 +257,237 @@ exports.createReservation = async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating reservation:', error);
+
+    if (error.message === 'No tables are available for the selected time slot') {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+    }
+
+    if (error.message === 'Customer profile not found') {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+    }
+
     res.status(500).json({
       success: false,
       message: 'Failed to create reservation',
+      error: error.message,
+    });
+  }
+};
+
+exports.createReservationPaymentIntent = async (req, res) => {
+  try {
+    let { customerId, reservationTime, guestCount, numberOfGuests } = req.body;
+    const guests = parseInt(numberOfGuests || guestCount);
+    customerId = await resolveCustomerId(req, customerId);
+
+    if (!customerId || !reservationTime || !guests) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reservation time and guest count are required',
+      });
+    }
+
+    if (guests <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Guest count must be at least 1',
+      });
+    }
+
+    const customer = await prisma.customer.findUnique({
+      where: { customerId: parseInt(customerId) },
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    const reservationDateTime = new Date(reservationTime);
+
+    if (Number.isNaN(reservationDateTime.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reservation time',
+      });
+    }
+
+    // Validate that at least one table is available before accepting payment.
+    await findAvailableTableNumber(reservationDateTime);
+
+    const {
+      reservationAmount,
+      onlinePaymentAmount,
+      remainingAmount,
+    } = calculateReservationAmounts(guests);
+
+    const paymentIntent = await stripeService.createPaymentIntent(
+      onlinePaymentAmount,
+      'lkr',
+      {
+        type: 'reservation_advance',
+        customerId: String(customerId),
+        guestCount: String(guests),
+        reservationTime: reservationDateTime.toISOString(),
+      }
+    );
+
+    res.json({
+      success: true,
+      data: {
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id,
+        reservationAmount,
+        onlinePaymentAmount,
+        remainingAmount,
+      },
+    });
+  } catch (error) {
+    console.error('Error creating reservation payment intent:', error);
+
+    if (error.code === 'amount_too_small') {
+      return res.status(400).json({
+        success: false,
+        code: error.code,
+        message:
+          'Advance payment amount is below the Stripe minimum for LKR. Please increase guests or adjust the reservation amount policy.',
+      });
+    }
+
+    if (
+      error.message === 'No tables are available for the selected time slot' ||
+      error.message === 'Customer profile not found'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Failed to initialize reservation payment',
+      error: error.message,
+    });
+  }
+};
+
+exports.confirmReservationWithPayment = async (req, res) => {
+  try {
+    const { paymentIntentId, reservationData } = req.body;
+    let { customerId, tableNumber, reservationTime, guestCount, numberOfGuests } = reservationData || {};
+    const guests = parseInt(numberOfGuests || guestCount);
+    customerId = await resolveCustomerId(req, customerId);
+
+    if (!paymentIntentId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment intent ID is required',
+      });
+    }
+
+    if (!customerId || !reservationTime || !guests) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reservation time and guest count are required',
+      });
+    }
+
+    const customer = await prisma.customer.findUnique({
+      where: { customerId: parseInt(customerId) },
+    });
+
+    if (!customer) {
+      return res.status(404).json({
+        success: false,
+        message: 'Customer not found',
+      });
+    }
+
+    const paymentIntent = await stripeService.retrievePaymentIntent(paymentIntentId);
+
+    if (paymentIntent.status !== 'succeeded') {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment is not completed',
+        status: paymentIntent.status,
+      });
+    }
+
+    const reservationDateTime = new Date(reservationTime);
+    if (Number.isNaN(reservationDateTime.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reservation time',
+      });
+    }
+
+    const {
+      reservationAmount,
+      onlinePaymentAmount,
+      remainingAmount,
+    } = calculateReservationAmounts(guests);
+
+    if (Math.round(onlinePaymentAmount * 100) !== paymentIntent.amount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Paid amount does not match required reservation advance payment',
+      });
+    }
+
+    const assignedTableNumber = await findAvailableTableNumber(reservationDateTime, tableNumber);
+
+    const reservation = await prisma.reservation.create({
+      data: {
+        customerId: parseInt(customerId),
+        tableNumber: assignedTableNumber,
+        reservationTime: reservationDateTime,
+        guestCount: guests,
+        status: 'PENDING',
+        reservationAmount,
+        onlinePaidAmount: onlinePaymentAmount,
+        remainingAmount,
+        paymentStatus: 'PARTIAL',
+        paymentTransactionId: paymentIntentId,
+      },
+      include: {
+        customer: {
+          include: {
+            user: true,
+          },
+        },
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Reservation created with advance payment',
+      data: reservation,
+    });
+  } catch (error) {
+    console.error('Error confirming reservation with payment:', error);
+
+    if (
+      error.message === 'No tables are available for the selected time slot' ||
+      error.message === 'Customer profile not found'
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: error.message,
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: 'Failed to confirm reservation payment',
       error: error.message,
     });
   }

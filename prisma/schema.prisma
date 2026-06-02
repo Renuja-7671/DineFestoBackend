@@ -253,6 +253,11 @@ model Reservation {
   reservationTime DateTime
   guestCount      Int
   status          String   @default("CONFIRMED") // CONFIRMED, CANCELLED, PENDING, SEATED, COMPLETED, NO_SHOW
+  reservationAmount Decimal @default(0) @db.Decimal(10, 2)
+  onlinePaidAmount  Decimal @default(0) @db.Decimal(10, 2)
+  remainingAmount   Decimal @default(0) @db.Decimal(10, 2)
+  paymentStatus     String  @default("PENDING") // PENDING, PARTIAL, PAID
+  paymentTransactionId String?
 }
 
 model Review {
@@ -331,4 +336,18 @@ model SecurityLog {
   status      String
   details     String?
   createdAt   DateTime @default(now())
+}
+
+model SalesForecast {
+  forecastId        Int      @id @default(autoincrement())
+  forecastDate      DateTime @db.Date
+  predictedRevenue  Decimal  @db.Decimal(12, 2)
+  lowerBoundRevenue Decimal  @db.Decimal(12, 2)
+  upperBoundRevenue Decimal  @db.Decimal(12, 2)
+  actualRevenue     Decimal? @db.Decimal(12, 2)
+  modelVersion      String   @default("prophet-v1")
+  generatedAt       DateTime @default(now())
+
+  @@unique([forecastDate, modelVersion])
+  @@index([forecastDate])
 }

@@ -80,6 +80,33 @@ npm start
 
 The server will start on `http://localhost:5000`
 
+## 📈 Sales Forecasting (Prophet)
+
+1. Install Python dependencies for forecasting:
+   ```bash
+   python3.12 -m venv .venv-forecast
+   .venv-forecast/bin/python -m pip install -r forecasting/requirements.txt
+   ```
+
+2. Run a manual forecast training job:
+   ```bash
+   npm run forecast:train
+   ```
+
+3. Enable daily scheduler in `.env`:
+   ```env
+   FORECAST_SCHEDULER_ENABLED=true
+   FORECAST_RUN_ON_STARTUP=true
+   FORECAST_SCHEDULE_HOUR=2
+   FORECAST_SCHEDULE_MINUTE=0
+   FORECAST_PYTHON_PATH=.venv-forecast/bin/python
+   FORECAST_DAYS=30
+   FORECAST_MODEL_VERSION=prophet-v1
+   ```
+
+4. Read forecast data via API:
+   - `GET /api/reports/sales-forecast?days=30`
+
 ## 📚 API Endpoints
 
 ### Authentication

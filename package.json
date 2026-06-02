@@ -11,7 +11,8 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:push": "prisma db push",
     "prisma:studio": "prisma studio",
-    "prisma:seed": "node prisma/seed.js"
+    "prisma:seed": "node prisma/seed.js",
+    "forecast:train": "python3 forecasting/train_sales_forecast.py"
   },
   "keywords": [
     "restaurant",
@@ -33,7 +34,8 @@
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
-    "nodemailer": "^7.0.12"
+    "nodemailer": "^7.0.12",
+    "stripe": "^20.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.2",

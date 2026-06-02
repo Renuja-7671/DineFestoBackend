@@ -21,6 +21,10 @@ const profileRoutes = require('./routes/profile.routes');
 const settingsRoutes = require('./routes/settings.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const paymentRoutes = require('./routes/payment.routes');
+const {
+  startForecastScheduler,
+  stopForecastScheduler,
+} = require('./services/forecastScheduler.service');
 
 const app = express();
 
@@ -74,22 +78,27 @@ app.use((err, req, res, next) => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n⚠️  Shutting down gracefully...');
+  stopForecastScheduler();
   await prisma.$disconnect();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
   console.log('\n⚠️  Shutting down gracefully...');
+  stopForecastScheduler();
   await prisma.$disconnect();
   process.exit(0);
 });
 
 // Start server
 const PORT = config.port;
-app.listen(PORT, () => {
+const HOST = '0.0.0.0'; // Listen on all network interfaces
+app.listen(PORT, HOST, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📝 Environment: ${config.nodeEnv}`);
   console.log(`🔗 API URL: http://localhost:${PORT}`);
+  console.log(`🌐 Network URL: http://192.168.1.97:5001/api`);
+  startForecastScheduler();
 });
 
 module.exports = app;

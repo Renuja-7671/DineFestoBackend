@@ -8,12 +8,12 @@ const router = express.Router();
 router.get('/', authenticate, reservationController.getAllReservations);
 router.get('/stats', authenticate, authorize('ADMIN', 'MANAGER'), reservationController.getReservationStats);
 router.get('/available-tables', authenticate, reservationController.getAvailableTables);
+router.post('/payment-intent', authenticate, reservationController.createReservationPaymentIntent);
+router.post('/confirm-with-payment', authenticate, reservationController.confirmReservationWithPayment);
 router.get('/:id', authenticate, reservationController.getReservationById);
 router.post('/', authenticate, reservationController.createReservation);
 router.put('/:id', authenticate, reservationController.updateReservation);
 router.put('/:id/cancel', authenticate, reservationController.cancelReservation);
 router.delete('/:id', authenticate, authorize('ADMIN', 'MANAGER'), reservationController.deleteReservation);
-
-module.exports = router;
 
 module.exports = router;

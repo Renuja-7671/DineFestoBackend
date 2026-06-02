@@ -31,4 +31,7 @@ router.get('/employees', reportController.getEmployeePerformance);
 // Order trends
 router.get('/orders', reportController.getOrderTrends);
 
+// Sales forecast
+router.get('/sales-forecast', reportController.getSalesForecast);
+
 module.exports = router;

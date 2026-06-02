@@ -954,3 +954,80 @@ exports.getDashboardOverview = async (req, res) => {
     });
   }
 };
+
+exports.getSalesForecast = async (req, res) => {
+  try {
+    const requestedDays = parseInt(req.query.days, 10);
+    const days = Number.isInteger(requestedDays) ? Math.min(Math.max(requestedDays, 1), 180) : 30;
+    const modelVersion =
+      req.query.modelVersion || process.env.FORECAST_MODEL_VERSION || 'prophet-v1';
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const endDate = new Date(today);
+    endDate.setDate(endDate.getDate() + days - 1);
+
+    const forecasts = await prisma.salesForecast.findMany({
+      where: {
+        modelVersion,
+        forecastDate: {
+          gte: today,
+          lte: endDate,
+        },
+      },
+      orderBy: {
+        forecastDate: 'asc',
+      },
+    });
+
+    const actuals = await prisma.$queryRaw`
+      SELECT DATE("createdAt") as date, SUM("totalAmount") as amount
+      FROM "Order"
+      WHERE "status" IN ('COMPLETED', 'SERVED')
+        AND DATE("createdAt") >= ${today}
+        AND DATE("createdAt") <= ${endDate}
+      GROUP BY DATE("createdAt")
+      ORDER BY date ASC
+    `;
+
+    const actualMap = new Map(
+      actuals.map(row => [
+        row.date.toISOString().split('T')[0],
+        parseFloat(row.amount || 0),
+      ])
+    );
+
+    const data = forecasts.map(item => {
+      const date = item.forecastDate.toISOString().split('T')[0];
+
+      return {
+        date,
+        predictedRevenue: parseFloat(item.predictedRevenue),
+        lowerBoundRevenue: parseFloat(item.lowerBoundRevenue),
+        upperBoundRevenue: parseFloat(item.upperBoundRevenue),
+        actualRevenue: actualMap.has(date) ? actualMap.get(date) : null,
+        modelVersion: item.modelVersion,
+        generatedAt: item.generatedAt,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        modelVersion,
+        days,
+        count: data.length,
+        hasForecast: data.length > 0,
+        forecast: data,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching sales forecast:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch sales forecast',
+      error: error.message,
+    });
+  }
+};
