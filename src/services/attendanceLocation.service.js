@@ -11,21 +11,74 @@ const haversineMeters = (lat1, lon1, lat2, lon2) => {
   return EARTH_RADIUS_METERS * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
-const getWorkplaceConfig = () => {
-  const latitude = parseFloat(process.env.WORKPLACE_LATITUDE);
-  const longitude = parseFloat(process.env.WORKPLACE_LONGITUDE);
+const getRadiusMeters = () => {
   const radiusMeters = parseFloat(process.env.WORKPLACE_GEOFENCE_RADIUS_METERS || '150');
+  return Number.isFinite(radiusMeters) ? radiusMeters : 150;
+};
+
+const parseCoordinatePair = (latitudeValue, longitudeValue) => {
+  const latitude = parseFloat(latitudeValue);
+  const longitude = parseFloat(longitudeValue);
 
   if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
     return null;
   }
 
-  return {
-    latitude,
-    longitude,
-    radiusMeters: Number.isFinite(radiusMeters) ? radiusMeters : 150,
-  };
+  return { latitude, longitude };
 };
+
+const getWorkplaceLocations = () => {
+  const radiusMeters = getRadiusMeters();
+  const locations = [];
+  const seen = new Set();
+
+  const addLocation = (latitude, longitude, label) => {
+    const key = `${latitude},${longitude}`;
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    locations.push({ latitude, longitude, radiusMeters, label });
+  };
+
+  const locationsEnv = process.env.WORKPLACE_LOCATIONS?.trim();
+  if (locationsEnv) {
+    locationsEnv.split(';').forEach((entry, index) => {
+      const [lat, lng] = entry.split(',').map((part) => part.trim());
+      const pair = parseCoordinatePair(lat, lng);
+      if (pair) {
+        addLocation(pair.latitude, pair.longitude, `Location ${index + 1}`);
+      }
+    });
+
+    if (locations.length > 0) {
+      return locations;
+    }
+  }
+
+  const primary = parseCoordinatePair(
+    process.env.WORKPLACE_LATITUDE,
+    process.env.WORKPLACE_LONGITUDE
+  );
+  if (primary) {
+    addLocation(primary.latitude, primary.longitude, 'Location 1');
+  }
+
+  for (let index = 2; index <= 10; index += 1) {
+    const pair = parseCoordinatePair(
+      process.env[`WORKPLACE_LATITUDE_${index}`],
+      process.env[`WORKPLACE_LONGITUDE_${index}`]
+    );
+    if (pair) {
+      addLocation(pair.latitude, pair.longitude, `Location ${index}`);
+    }
+  }
+
+  return locations;
+};
+
+const getWorkplaceConfig = () => getWorkplaceLocations()[0] ?? null;
 
 const parseDeviceLocation = (body = {}) => {
   const latitude = parseFloat(body.latitude);
@@ -49,29 +102,46 @@ const parseDeviceLocation = (body = {}) => {
 };
 
 const evaluateWorkplaceVerification = (latitude, longitude) => {
-  const workplace = getWorkplaceConfig();
+  const locations = getWorkplaceLocations();
 
-  if (!workplace) {
+  if (locations.length === 0) {
     return {
       workplaceConfigured: false,
       atWorkplace: null,
       distanceMeters: null,
       allowedRadiusMeters: null,
+      matchedLocation: null,
+      locationCount: 0,
     };
   }
 
-  const distanceMeters = haversineMeters(
-    latitude,
-    longitude,
-    workplace.latitude,
-    workplace.longitude
-  );
+  let closestDistance = Infinity;
+  let matchedLocation = null;
+
+  locations.forEach((workplace) => {
+    const distanceMeters = haversineMeters(
+      latitude,
+      longitude,
+      workplace.latitude,
+      workplace.longitude
+    );
+
+    if (distanceMeters < closestDistance) {
+      closestDistance = distanceMeters;
+    }
+
+    if (distanceMeters <= workplace.radiusMeters && !matchedLocation) {
+      matchedLocation = workplace;
+    }
+  });
 
   return {
     workplaceConfigured: true,
-    atWorkplace: distanceMeters <= workplace.radiusMeters,
-    distanceMeters: Math.round(distanceMeters * 10) / 10,
-    allowedRadiusMeters: workplace.radiusMeters,
+    atWorkplace: matchedLocation !== null,
+    distanceMeters: Math.round(closestDistance * 10) / 10,
+    allowedRadiusMeters: locations[0].radiusMeters,
+    matchedLocation: matchedLocation?.label ?? null,
+    locationCount: locations.length,
   };
 };
 
@@ -84,8 +154,8 @@ const assertLocationAllowed = (verification) => {
   if (enforceGeofence && verification.atWorkplace === false) {
     throw new Error(
       `You must be at the workplace to punch attendance. ` +
-        `Current distance: ${verification.distanceMeters}m ` +
-        `(allowed within ${verification.allowedRadiusMeters}m).`
+        `Closest distance: ${verification.distanceMeters}m ` +
+        `(allowed within ${verification.allowedRadiusMeters}m of a registered site).`
     );
   }
 };
@@ -121,13 +191,14 @@ const buildCheckOutLocationData = (body) => {
 };
 
 const getAttendanceLocationPolicy = () => {
-  const workplace = getWorkplaceConfig();
+  const locations = getWorkplaceLocations();
 
   return {
     locationRequired: true,
-    workplaceConfigured: Boolean(workplace),
+    workplaceConfigured: locations.length > 0,
+    locationCount: locations.length,
     enforceGeofence: process.env.ATTENDANCE_ENFORCE_GEOFENCE !== 'false',
-    allowedRadiusMeters: workplace?.radiusMeters ?? null,
+    allowedRadiusMeters: locations[0]?.radiusMeters ?? null,
   };
 };
 
@@ -138,4 +209,5 @@ module.exports = {
   buildCheckOutLocationData,
   getAttendanceLocationPolicy,
   getWorkplaceConfig,
+  getWorkplaceLocations,
 };

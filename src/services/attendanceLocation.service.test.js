@@ -46,6 +46,18 @@ describe('attendanceLocation.service', () => {
       expect(result.atWorkplace).toBe(false);
       expect(result.distanceMeters).toBeGreaterThan(150);
     });
+
+    it('accepts check-in when within any configured workplace site', () => {
+      process.env.WORKPLACE_LATITUDE = '6.9271';
+      process.env.WORKPLACE_LONGITUDE = '79.8612';
+      process.env.WORKPLACE_LATITUDE_2 = '6.9500';
+      process.env.WORKPLACE_LONGITUDE_2 = '79.9000';
+
+      const farFromPrimary = evaluateWorkplaceVerification(6.9500, 79.9000);
+      expect(farFromPrimary.atWorkplace).toBe(true);
+      expect(farFromPrimary.matchedLocation).toBe('Location 2');
+      expect(farFromPrimary.locationCount).toBe(2);
+    });
   });
 
   describe('buildCheckInLocationData', () => {

@@ -21,6 +21,7 @@ const settingsRoutes = require('./routes/settings.routes');
 const notificationRoutes = require('./routes/notification.routes');
 const paymentRoutes = require('./routes/payment.routes');
 const cronRoutes = require('./routes/cron.routes');
+const chatbotRoutes = require('./routes/chatbot.routes');
 
 const app = express();
 
@@ -55,6 +56,7 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/cron', cronRoutes);
+app.use('/api/chatbot', chatbotRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });

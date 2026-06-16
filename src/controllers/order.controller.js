@@ -62,12 +62,52 @@ const mapOrderForDetail = (order) => ({
   customer: mapOrderCustomer(order),
 });
 
+const mapOrderForListWithItems = (order) => ({
+  ...mapOrderForList(order),
+  items: mapOrderItems(order.items || []),
+  orderItems: mapOrderItems(order.items || []),
+});
+
+const orderListInclude = {
+  customer: {
+    include: {
+      user: true,
+    },
+  },
+  staff: {
+    include: {
+      user: true,
+    },
+  },
+  items: {
+    include: {
+      menuItem: {
+        select: {
+          itemId: true,
+          name: true,
+        },
+      },
+    },
+  },
+  _count: {
+    select: { items: true },
+  },
+};
+
 const buildOrderWhereClause = (req) => {
-  const { status, customerId, startDate, endDate, search } = req.query;
+  const { status, customerId, startDate, endDate, search, type, statusGroup } = req.query;
   const where = {};
 
-  if (status && status !== 'ALL') {
+  if (statusGroup === 'ACTIVE') {
+    where.status = { in: ['PENDING', 'PREPARING', 'READY'] };
+  } else if (statusGroup === 'COMPLETED') {
+    where.status = { in: ['SERVED', 'COMPLETED'] };
+  } else if (status && status !== 'ALL') {
     where.status = status;
+  }
+
+  if (type && type !== 'ALL') {
+    where.type = type;
   }
 
   if (customerId) {
@@ -106,6 +146,13 @@ const buildOrderWhereClause = (req) => {
           },
         },
       },
+      {
+        staff: {
+          is: {
+            fullName: { contains: trimmedSearch, mode: 'insensitive' },
+          },
+        },
+      },
     ];
 
     if (/^\d+$/.test(trimmedSearch)) {
@@ -138,21 +185,7 @@ exports.getAllOrders = async (req, res) => {
           where,
           skip,
           take: limit,
-          include: {
-            customer: {
-              include: {
-                user: true,
-              },
-            },
-            staff: {
-              include: {
-                user: true,
-              },
-            },
-            _count: {
-              select: { items: true },
-            },
-          },
+          include: orderListInclude,
           orderBy: {
             createdAt: 'desc',
           },
@@ -162,7 +195,7 @@ exports.getAllOrders = async (req, res) => {
 
       return res.json({
         success: true,
-        data: orders.map(mapOrderForList),
+        data: orders.map(mapOrderForListWithItems),
         pagination: {
           page,
           limit,
@@ -202,11 +235,7 @@ exports.getAllOrders = async (req, res) => {
 
     res.json({
       success: true,
-      data: orders.map((order) => ({
-        ...mapOrderForList(order),
-        items: mapOrderItems(order.items),
-        orderItems: mapOrderItems(order.items),
-      })),
+      data: orders.map(mapOrderForListWithItems),
     });
   } catch (error) {
     console.error('Error fetching orders:', error);
