@@ -1,51 +1,131 @@
 const prisma = require('../config/database');
 
-// Get all reviews with filters
-exports.getAllReviews = async (req, res) => {
-  try {
-    const { rating, menuItemId, customerId, sortBy = 'createdAt', order = 'desc' } = req.query;
+const reviewInclude = {
+  customer: {
+    include: {
+      user: {
+        select: {
+          email: true,
+        },
+      },
+    },
+  },
+  menuItem: {
+    select: {
+      itemId: true,
+      name: true,
+      imageUrl: true,
+      price: true,
+    },
+  },
+};
 
-    const filters = {};
+const parsePagination = (query) => {
+  const hasPagination = query.page !== undefined || query.limit !== undefined;
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 10, 1), 100);
 
-    // Filter by rating
-    if (rating) {
-      filters.rating = parseInt(rating);
-    }
+  return { hasPagination, page, limit, skip: (page - 1) * limit };
+};
 
-    // Filter by menu item
-    if (menuItemId) {
-      filters.menuItemId = parseInt(menuItemId);
-    }
+const buildReviewWhereClause = (query) => {
+  const { rating, menuItemId, customerId, search } = query;
+  const where = {};
 
-    // Filter by customer
-    if (customerId) {
-      filters.customerId = parseInt(customerId);
-    }
+  if (rating && rating !== 'ALL') {
+    where.rating = parseInt(rating, 10);
+  }
 
-    const reviews = await prisma.review.findMany({
-      where: filters,
-      include: {
+  if (menuItemId) {
+    where.menuItemId = parseInt(menuItemId, 10);
+  }
+
+  if (customerId) {
+    where.customerId = parseInt(customerId, 10);
+  }
+
+  const trimmedSearch = search?.trim();
+  if (trimmedSearch) {
+    const searchConditions = [
+      {
         customer: {
-          include: {
+          is: {
+            fullName: { contains: trimmedSearch, mode: 'insensitive' },
+          },
+        },
+      },
+      {
+        customer: {
+          is: {
             user: {
-              select: {
-                email: true,
+              is: {
+                email: { contains: trimmedSearch, mode: 'insensitive' },
               },
             },
           },
         },
+      },
+      {
         menuItem: {
-          select: {
-            itemId: true,
-            name: true,
-            imageUrl: true,
-            price: true,
+          is: {
+            name: { contains: trimmedSearch, mode: 'insensitive' },
           },
         },
       },
-      orderBy: {
-        [sortBy]: order,
+      {
+        comment: { contains: trimmedSearch, mode: 'insensitive' },
       },
+    ];
+
+    if (/^\d+$/.test(trimmedSearch)) {
+      searchConditions.unshift({ reviewId: parseInt(trimmedSearch, 10) });
+    }
+
+    where.OR = searchConditions;
+  }
+
+  return where;
+};
+
+// Get all reviews with filters
+exports.getAllReviews = async (req, res) => {
+  try {
+    const { sortBy = 'createdAt', order = 'desc' } = req.query;
+    const where = buildReviewWhereClause(req.query);
+    const { hasPagination, page, limit, skip } = parsePagination(req.query);
+
+    const orderBy = {
+      [sortBy]: order,
+    };
+
+    if (hasPagination) {
+      const [reviews, total] = await Promise.all([
+        prisma.review.findMany({
+          where,
+          skip,
+          take: limit,
+          include: reviewInclude,
+          orderBy,
+        }),
+        prisma.review.count({ where }),
+      ]);
+
+      return res.status(200).json({
+        success: true,
+        data: reviews,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit) || 0,
+        },
+      });
+    }
+
+    const reviews = await prisma.review.findMany({
+      where,
+      include: reviewInclude,
+      orderBy,
     });
 
     res.status(200).json({

@@ -5,14 +5,149 @@ const {
   syncMenuItemAvailability,
 } = require('../services/inventoryConsumption.service');
 
+const parsePagination = (query) => {
+  const hasPagination = query.page !== undefined || query.limit !== undefined;
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 10, 1), 100);
+
+  return { hasPagination, page, limit, skip: (page - 1) * limit };
+};
+
+const mapInventoryItem = (item) => ({
+  inventoryId: item.inventoryId,
+  itemName: item.itemName,
+  quantity: parseFloat(item.quantity),
+  unit: item.unit,
+  reorderLevel: parseFloat(item.reorderLevel),
+  costPerUnit: parseFloat(item.costPerUnit),
+  lastUpdated: item.lastUpdated,
+  menuItemsUsingCount: item.menuItemsUsingCount ?? item._count?.usedInRecipes ?? 0,
+});
+
+const buildInventorySearchWhere = (search) => {
+  const trimmedSearch = search?.trim();
+  if (!trimmedSearch) {
+    return {};
+  }
+
+  return {
+    itemName: {
+      contains: trimmedSearch,
+      mode: 'insensitive',
+    },
+  };
+};
+
+const fetchPaginatedLowStockItems = async ({ search, skip, limit }) => {
+  const trimmedSearch = search?.trim();
+  const searchPattern = trimmedSearch ? `%${trimmedSearch}%` : null;
+
+  const [inventoryItems, countResult] = searchPattern
+    ? await Promise.all([
+        prisma.$queryRaw`
+          SELECT
+            i."inventoryId",
+            i."itemName",
+            i.quantity::float8 AS quantity,
+            i.unit,
+            i."reorderLevel"::float8 AS "reorderLevel",
+            i."costPerUnit"::float8 AS "costPerUnit",
+            i."lastUpdated",
+            COUNT(r."recipeId")::int AS "menuItemsUsingCount"
+          FROM "InventoryItem" i
+          LEFT JOIN "RecipeIngredient" r ON r."inventoryId" = i."inventoryId"
+          WHERE i.quantity <= i."reorderLevel"
+            AND i."itemName" ILIKE ${searchPattern}
+          GROUP BY i."inventoryId"
+          ORDER BY i."itemName" ASC
+          LIMIT ${limit} OFFSET ${skip}
+        `,
+        prisma.$queryRaw`
+          SELECT COUNT(*)::int AS count
+          FROM "InventoryItem"
+          WHERE quantity <= "reorderLevel"
+            AND "itemName" ILIKE ${searchPattern}
+        `,
+      ])
+    : await Promise.all([
+        prisma.$queryRaw`
+          SELECT
+            i."inventoryId",
+            i."itemName",
+            i.quantity::float8 AS quantity,
+            i.unit,
+            i."reorderLevel"::float8 AS "reorderLevel",
+            i."costPerUnit"::float8 AS "costPerUnit",
+            i."lastUpdated",
+            COUNT(r."recipeId")::int AS "menuItemsUsingCount"
+          FROM "InventoryItem" i
+          LEFT JOIN "RecipeIngredient" r ON r."inventoryId" = i."inventoryId"
+          WHERE i.quantity <= i."reorderLevel"
+          GROUP BY i."inventoryId"
+          ORDER BY i."itemName" ASC
+          LIMIT ${limit} OFFSET ${skip}
+        `,
+        prisma.$queryRaw`
+          SELECT COUNT(*)::int AS count
+          FROM "InventoryItem"
+          WHERE quantity <= "reorderLevel"
+        `,
+      ]);
+
+  return {
+    items: inventoryItems.map(mapInventoryItem),
+    total: countResult[0]?.count ?? 0,
+  };
+};
+
 // Get all inventory items
 exports.getAllInventoryItems = async (req, res) => {
   try {
-    const { lowStock } = req.query;
+    const { lowStock, search } = req.query;
+    const { hasPagination, page, limit, skip } = parsePagination(req.query);
 
-    // When lowStock=true we filter using Prisma's field comparison support.
-    // Prisma doesn't support field-to-field comparisons directly, so we use
-    // a raw query only for the filter but still return consistent camelCase data.
+    if (hasPagination) {
+      if (lowStock === 'true') {
+        const { items, total } = await fetchPaginatedLowStockItems({ search, skip, limit });
+
+        return res.json({
+          success: true,
+          data: items,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit) || 0,
+          },
+        });
+      }
+
+      const where = buildInventorySearchWhere(search);
+      const [inventoryItems, total] = await Promise.all([
+        prisma.inventoryItem.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: { itemName: 'asc' },
+          include: {
+            _count: { select: { usedInRecipes: true } },
+          },
+        }),
+        prisma.inventoryItem.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: inventoryItems.map(mapInventoryItem),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit) || 0,
+        },
+      });
+    }
+
     let inventoryItems;
 
     if (lowStock === 'true') {
@@ -38,16 +173,9 @@ exports.getAllInventoryItems = async (req, res) => {
       });
     }
 
-    // Attach the count of menu items that use each ingredient
-    const enriched = inventoryItems.map((item) => ({
-      ...item,
-      menuItemsUsingCount: item._count?.usedInRecipes ?? 0,
-      _count: undefined,
-    }));
-
     res.json({
       success: true,
-      data: enriched,
+      data: inventoryItems.map(mapInventoryItem),
     });
   } catch (error) {
     console.error('Error fetching inventory items:', error);

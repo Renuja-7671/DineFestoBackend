@@ -144,10 +144,17 @@ const resolveCustomerId = async (req, customerIdFromBody) => {
 // Get all reservations
 exports.getAllReservations = async (req, res) => {
   try {
-    const { status, date, customerId } = req.query;
+    const { status, date, customerId, search } = req.query;
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 10, 1), 100);
+    const skip = (page - 1) * limit;
 
     const where = {};
-    if (status) where.status = status;
+
+    if (status && status !== 'ALL') {
+      where.status = status;
+    }
 
     if (req.user.role === 'CUSTOMER') {
       if (req.user.customerProfile && req.user.customerProfile.customerId) {
@@ -174,15 +181,65 @@ exports.getAllReservations = async (req, res) => {
       };
     }
 
-    const reservations = await prisma.reservation.findMany({
-      where,
-      include: {
-        customer: {
-          include: {
-            user: true,
+    const trimmedSearch = search?.trim();
+    if (trimmedSearch) {
+      const searchConditions = [
+        { guestName: { contains: trimmedSearch, mode: 'insensitive' } },
+        {
+          customer: {
+            is: {
+              fullName: { contains: trimmedSearch, mode: 'insensitive' },
+            },
           },
         },
+      ];
+
+      if (/^\d+$/.test(trimmedSearch)) {
+        const numericValue = parseInt(trimmedSearch, 10);
+        searchConditions.push({ tableNumber: numericValue });
+        searchConditions.push({ reservationId: numericValue });
+      }
+
+      where.OR = searchConditions;
+    }
+
+    const include = {
+      customer: {
+        include: {
+          user: true,
+        },
       },
+    };
+
+    if (hasPagination) {
+      const [reservations, total] = await Promise.all([
+        prisma.reservation.findMany({
+          where,
+          skip,
+          take: limit,
+          include,
+          orderBy: {
+            reservationTime: 'desc',
+          },
+        }),
+        prisma.reservation.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: reservations,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit) || 0,
+        },
+      });
+    }
+
+    const reservations = await prisma.reservation.findMany({
+      where,
+      include,
       orderBy: {
         reservationTime: 'desc',
       },

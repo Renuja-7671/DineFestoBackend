@@ -11,17 +11,123 @@ const {
   getAttendanceLocationPolicy,
 } = require('../services/attendanceLocation.service');
 
+const STAFF_ROLES = ['MANAGER', 'WAITER', 'CHEF'];
+
+const mapEmployeeForResponse = (emp) => {
+  const { passwordHash, employeeProfile, ...rest } = emp;
+
+  return {
+    ...rest,
+    id: emp.userId,
+    isActive: emp.isActive,
+    fullName: employeeProfile?.fullName || 'N/A',
+    contact: employeeProfile?.contact || null,
+    phoneNumber: employeeProfile?.contact || null,
+    position: employeeProfile?.designation || 'N/A',
+    designation: employeeProfile?.designation || 'N/A',
+    salary: employeeProfile?.salary || 0,
+    joinDate: employeeProfile?.joinDate || null,
+    employeeId: employeeProfile?.employeeId || null,
+    employee: employeeProfile
+      ? {
+          position: employeeProfile.designation,
+          designation: employeeProfile.designation,
+          salary: employeeProfile.salary,
+          fullName: employeeProfile.fullName,
+          contact: employeeProfile.contact,
+          phoneNumber: employeeProfile.contact,
+          joinDate: employeeProfile.joinDate,
+        }
+      : null,
+  };
+};
+
+const buildEmployeeWhereClause = (query) => {
+  const { role, search } = query;
+  const where = {
+    employeeProfile: { isNot: null },
+  };
+
+  if (role && role !== 'ALL') {
+    where.role = role;
+  } else {
+    where.role = { in: STAFF_ROLES };
+  }
+
+  const trimmedSearch = search?.trim();
+  if (trimmedSearch) {
+    const searchConditions = [
+      { email: { contains: trimmedSearch, mode: 'insensitive' } },
+      {
+        employeeProfile: {
+          is: {
+            fullName: { contains: trimmedSearch, mode: 'insensitive' },
+          },
+        },
+      },
+      {
+        employeeProfile: {
+          is: {
+            designation: { contains: trimmedSearch, mode: 'insensitive' },
+          },
+        },
+      },
+    ];
+
+    const matchingRoles = STAFF_ROLES.filter((staffRole) =>
+      staffRole.toLowerCase().includes(trimmedSearch.toLowerCase())
+    );
+
+    if (matchingRoles.length > 0) {
+      searchConditions.push({ role: { in: matchingRoles } });
+    }
+
+    where.OR = searchConditions;
+  }
+
+  return where;
+};
+
+const parsePagination = (query) => {
+  const hasPagination = query.page !== undefined || query.limit !== undefined;
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 10, 1), 100);
+
+  return { hasPagination, page, limit, skip: (page - 1) * limit };
+};
+
 // Get all employees
 exports.getAllEmployees = async (req, res) => {
   try {
-    const { role } = req.query;
-    
-    const where = {
-      role: { not: 'CUSTOMER' },
-    };
-    
-    if (role) {
-      where.role = role;
+    const where = buildEmployeeWhereClause(req.query);
+    const { hasPagination, page, limit, skip } = parsePagination(req.query);
+
+    if (hasPagination) {
+      const [employees, total] = await Promise.all([
+        prisma.user.findMany({
+          where,
+          skip,
+          take: limit,
+          include: {
+            employeeProfile: true,
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+        }),
+        prisma.user.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: employees.map(mapEmployeeForResponse),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit) || 0,
+        },
+      });
     }
 
     const employees = await prisma.user.findMany({
@@ -34,37 +140,9 @@ exports.getAllEmployees = async (req, res) => {
       },
     });
 
-    // Flatten and sanitize employee data for frontend
-    const sanitizedEmployees = employees.map(emp => {
-      const { passwordHash, employeeProfile, ...rest } = emp;
-      return {
-        ...rest,
-        id: emp.userId, // Use userId as id for consistency
-        isActive: emp.isActive,
-        fullName: employeeProfile?.fullName || 'N/A',
-        contact: employeeProfile?.contact || null,
-        phoneNumber: employeeProfile?.contact || null, // Alias for backward compatibility
-        position: employeeProfile?.designation || 'N/A',
-        designation: employeeProfile?.designation || 'N/A',
-        salary: employeeProfile?.salary || 0,
-        joinDate: employeeProfile?.joinDate || null,
-        employeeId: employeeProfile?.employeeId || null,
-        // Keep the nested structure for backward compatibility
-        employee: employeeProfile ? {
-          position: employeeProfile.designation,
-          designation: employeeProfile.designation,
-          salary: employeeProfile.salary,
-          fullName: employeeProfile.fullName,
-          contact: employeeProfile.contact,
-          phoneNumber: employeeProfile.contact,
-          joinDate: employeeProfile.joinDate,
-        } : null,
-      };
-    });
-
     res.json({
       success: true,
-      data: sanitizedEmployees,
+      data: employees.map(mapEmployeeForResponse),
     });
   } catch (error) {
     console.error('Error fetching employees:', error);
@@ -96,29 +174,7 @@ exports.getEmployeeById = async (req, res) => {
     }
 
     // Flatten and remove password hash
-    const { passwordHash, employeeProfile, ...rest } = employee;
-    const sanitizedEmployee = {
-      ...rest,
-      id: employee.userId,
-      isActive: employee.isActive,
-      fullName: employeeProfile?.fullName || 'N/A',
-      contact: employeeProfile?.contact || null,
-      phoneNumber: employeeProfile?.contact || null,
-      position: employeeProfile?.designation || 'N/A',
-      designation: employeeProfile?.designation || 'N/A',
-      salary: employeeProfile?.salary || 0,
-      joinDate: employeeProfile?.joinDate || null,
-      employeeId: employeeProfile?.employeeId || null,
-      employee: employeeProfile ? {
-        position: employeeProfile.designation,
-        designation: employeeProfile.designation,
-        salary: employeeProfile.salary,
-        fullName: employeeProfile.fullName,
-        contact: employeeProfile.contact,
-        phoneNumber: employeeProfile.contact,
-        joinDate: employeeProfile.joinDate,
-      } : null,
-    };
+    const sanitizedEmployee = mapEmployeeForResponse(employee);
 
     res.json({
       success: true,

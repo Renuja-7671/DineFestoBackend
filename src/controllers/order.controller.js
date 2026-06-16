@@ -3,24 +3,173 @@ const inventoryConsumptionService = require('../services/inventoryConsumption.se
 
 const VALID_ORDER_TYPES = ['DINE_IN', 'TAKEAWAY'];
 
+const mapOrderCustomer = (order) => {
+  if (order.customer) {
+    return {
+      ...order.customer,
+      fullName: order.customer.fullName || order.customer.user?.fullName || 'N/A',
+      email: order.customer.user?.email || 'N/A',
+      phoneNumber: order.customer.phoneNumber || order.customer.user?.phoneNumber || 'N/A',
+    };
+  }
+
+  if (order.guestName) {
+    return {
+      fullName: order.guestName,
+      email: 'Walk-in Customer',
+      phoneNumber: order.guestPhone || 'N/A',
+      isGuest: true,
+    };
+  }
+
+  return null;
+};
+
+const mapOrderItems = (items = []) =>
+  items.map((item) => ({
+    ...item,
+    price: item.unitPrice,
+  }));
+
+const mapOrderForList = (order) => ({
+  orderId: order.orderId,
+  id: order.orderId,
+  customerId: order.customerId,
+  staffId: order.staffId,
+  guestName: order.guestName,
+  guestPhone: order.guestPhone,
+  status: order.status,
+  type: order.type,
+  tableNumber: order.tableNumber,
+  totalAmount: order.totalAmount,
+  createdAt: order.createdAt,
+  customer: mapOrderCustomer(order),
+  staff: order.staff
+    ? {
+        ...order.staff,
+        fullName: order.staff.fullName || order.staff.user?.fullName || 'N/A',
+      }
+    : null,
+  _count: {
+    orderItems: order._count?.items ?? order.items?.length ?? 0,
+  },
+});
+
+const mapOrderForDetail = (order) => ({
+  ...order,
+  id: order.orderId,
+  orderItems: mapOrderItems(order.items),
+  customer: mapOrderCustomer(order),
+});
+
+const buildOrderWhereClause = (req) => {
+  const { status, customerId, startDate, endDate, search } = req.query;
+  const where = {};
+
+  if (status && status !== 'ALL') {
+    where.status = status;
+  }
+
+  if (customerId) {
+    where.customerId = parseInt(customerId, 10);
+  }
+
+  if (startDate || endDate) {
+    where.createdAt = {};
+    if (startDate) where.createdAt.gte = new Date(startDate);
+    if (endDate) where.createdAt.lte = new Date(endDate);
+  }
+
+  if (req.user.role === 'CUSTOMER' && req.user.customerProfile) {
+    where.customerId = req.user.customerProfile.customerId;
+  }
+
+  const trimmedSearch = search?.trim();
+  if (trimmedSearch) {
+    const searchConditions = [
+      { guestName: { contains: trimmedSearch, mode: 'insensitive' } },
+      {
+        customer: {
+          is: {
+            fullName: { contains: trimmedSearch, mode: 'insensitive' },
+          },
+        },
+      },
+      {
+        customer: {
+          is: {
+            user: {
+              is: {
+                email: { contains: trimmedSearch, mode: 'insensitive' },
+              },
+            },
+          },
+        },
+      },
+    ];
+
+    if (/^\d+$/.test(trimmedSearch)) {
+      searchConditions.unshift({ orderId: parseInt(trimmedSearch, 10) });
+    }
+
+    where.OR = searchConditions;
+  }
+
+  return where;
+};
+
+const parsePagination = (query) => {
+  const hasPagination = query.page !== undefined || query.limit !== undefined;
+  const page = Math.max(parseInt(query.page, 10) || 1, 1);
+  const limit = Math.min(Math.max(parseInt(query.limit, 10) || 10, 1), 100);
+
+  return { hasPagination, page, limit, skip: (page - 1) * limit };
+};
+
 // Get all orders with filters
 exports.getAllOrders = async (req, res) => {
   try {
-    const { status, customerId, startDate, endDate } = req.query;
-    
-    const where = {};
-    if (status) where.status = status;
-    if (customerId) where.customerId = parseInt(customerId);
-    if (startDate || endDate) {
-      where.createdAt = {};
-      if (startDate) where.createdAt.gte = new Date(startDate);
-      if (endDate) where.createdAt.lte = new Date(endDate);
-    }
+    const where = buildOrderWhereClause(req);
+    const { hasPagination, page, limit, skip } = parsePagination(req.query);
 
-    // Filter by customer if user is a customer (not staff)
-    // Staff and admin can see all orders, customers only see their own
-    if (req.user.role === 'CUSTOMER' && req.user.customerProfile) {
-      where.customerId = req.user.customerProfile.customerId;
+    if (hasPagination) {
+      const [orders, total] = await Promise.all([
+        prisma.order.findMany({
+          where,
+          skip,
+          take: limit,
+          include: {
+            customer: {
+              include: {
+                user: true,
+              },
+            },
+            staff: {
+              include: {
+                user: true,
+              },
+            },
+            _count: {
+              select: { items: true },
+            },
+          },
+          orderBy: {
+            createdAt: 'desc',
+          },
+        }),
+        prisma.order.count({ where }),
+      ]);
+
+      return res.json({
+        success: true,
+        data: orders.map(mapOrderForList),
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit) || 0,
+        },
+      });
     }
 
     const orders = await prisma.order.findMany({
@@ -51,33 +200,13 @@ exports.getAllOrders = async (req, res) => {
       },
     });
 
-    // Map orderId to id for frontend consistency
-    const mappedOrders = orders.map(order => ({
-      ...order,
-      id: order.orderId,
-      _count: {
-        orderItems: order.items?.length || 0,
-      },
-      orderItems: order.items?.map(item => ({
-        ...item,
-        price: item.unitPrice, // Map unitPrice to price for frontend
-      })) || [],
-      customer: order.customer ? {
-        ...order.customer,
-        fullName: order.customer.fullName || order.customer.user?.fullName || 'N/A',
-        email: order.customer.user?.email || 'N/A',
-        phoneNumber: order.customer.phoneNumber || order.customer.user?.phoneNumber || 'N/A',
-      } : (order.guestName ? {
-        fullName: order.guestName,
-        email: 'Walk-in Customer',
-        phoneNumber: order.guestPhone || 'N/A',
-        isGuest: true,
-      } : null),
-    }));
-
     res.json({
       success: true,
-      data: mappedOrders,
+      data: orders.map((order) => ({
+        ...mapOrderForList(order),
+        items: mapOrderItems(order.items),
+        orderItems: mapOrderItems(order.items),
+      })),
     });
   } catch (error) {
     console.error('Error fetching orders:', error);
@@ -138,25 +267,7 @@ exports.getOrderById = async (req, res) => {
     }
 
     // Map orderId to id for frontend consistency
-    const mappedOrder = {
-      ...order,
-      id: order.orderId,
-      orderItems: order.items?.map(item => ({
-        ...item,
-        price: item.unitPrice, // Map unitPrice to price for frontend
-      })) || [],
-      customer: order.customer ? {
-        ...order.customer,
-        fullName: order.customer.fullName || order.customer.user?.fullName || 'N/A',
-        email: order.customer.user?.email || 'N/A',
-        phoneNumber: order.customer.phoneNumber || order.customer.user?.phoneNumber || 'N/A',
-      } : (order.guestName ? {
-        fullName: order.guestName,
-        email: 'Walk-in Customer',
-        phoneNumber: order.guestPhone || 'N/A',
-        isGuest: true,
-      } : null),
-    };
+    const mappedOrder = mapOrderForDetail(order);
 
     res.json({
       success: true,
