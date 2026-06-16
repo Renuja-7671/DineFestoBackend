@@ -114,34 +114,10 @@ async function main() {
 
   // Create Employees
   console.log('👥 Creating employees...');
-  const managerPassword = await bcrypt.hash('manager123', 10);
   const waiterPassword = await bcrypt.hash('waiter123', 10);
   const chefPassword = await bcrypt.hash('chef123', 10);
 
   const employees = [];
-  
-  // Managers
-  for (let i = 0; i < 3; i++) {
-    const user = await prisma.user.create({
-      data: {
-        email: `manager${i + 1}@rms.lk`,
-        passwordHash: managerPassword,
-        role: 'MANAGER',
-      },
-    });
-    
-    const employee = await prisma.employee.create({
-      data: {
-        userId: user.userId,
-        fullName: getRandomSriLankanName(),
-        contact: getRandomPhoneNumber(),
-        designation: 'Floor Manager',
-        salary: 75000 + (i * 5000),
-        joinDate: getRandomDate(new Date(2020, 0, 1), new Date(2023, 0, 1)),
-      },
-    });
-    employees.push(employee);
-  }
 
   // Waiters
   for (let i = 0; i < 6; i++) {
@@ -467,7 +443,6 @@ async function main() {
   console.log('✅ Database seeded successfully!');
   console.log('\n📊 Summary:');
   console.log(`   - Admin: 1 (admin@rms.lk / admin123)`);
-  console.log(`   - Managers: 3 (manager1-3@rms.lk / manager123)`);
   console.log(`   - Waiters: 6 (waiter1-6@rms.lk / waiter123)`);
   console.log(`   - Chefs: 4 (chef1-4@rms.lk / chef123)`);
   console.log(`   - Customers: 25 (customer1-25@example.lk / customer123)`);

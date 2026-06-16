@@ -193,7 +193,7 @@ exports.deleteNotification = async (req, res) => {
     }
 
     // Only the owner or an admin may delete
-    if (existing.userId !== req.user.userId && req.user.role !== 'ADMIN') {
+    if (existing.userId !== req.user.userId && !['ADMIN', 'MANAGER'].includes(req.user.role)) {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 

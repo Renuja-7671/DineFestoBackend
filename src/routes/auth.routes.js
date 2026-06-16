@@ -34,7 +34,7 @@ const createEmployeeValidation = [
   body('phoneNumber').optional().matches(/^[0-9+\-() ]{7,20}$/).withMessage('Invalid phone number format'),
   body('designation').trim().notEmpty().withMessage('Designation is required'),
   body('salary').isNumeric().withMessage('Valid salary is required'),
-  body('role').isIn(['MANAGER', 'WAITER', 'CHEF']).withMessage('Invalid role'),
+  body('role').isIn(['WAITER', 'CHEF']).withMessage('Invalid role'),
   validate,
 ];
 

@@ -1,6 +1,17 @@
 const jwt = require('jsonwebtoken');
 const config = require('../config');
 const prisma = require('../config/database');
+const { isAdminPortalRole } = require('../constants/roles');
+
+const flattenRoles = (...roles) => roles.flat();
+
+const expandAdminPortalAccess = (roles) => {
+  const expanded = new Set(flattenRoles(...roles));
+  if (expanded.has('ADMIN')) {
+    expanded.add('MANAGER');
+  }
+  return [...expanded];
+};
 
 /**
  * Verify JWT token and attach user to request
@@ -54,12 +65,14 @@ const authenticate = async (req, res, next) => {
  * Check if user has required role(s)
  */
 const authorize = (...roles) => {
+  const allowedRoles = expandAdminPortalAccess(roles);
+
   return (req, res, next) => {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    if (!roles.includes(req.user.role)) {
+    if (!allowedRoles.includes(req.user.role)) {
       return res.status(403).json({ error: 'Access denied. Insufficient permissions.' });
     }
 
@@ -106,4 +119,5 @@ module.exports = {
   authenticate,
   authorize,
   optionalAuth,
+  isAdminPortalRole,
 };

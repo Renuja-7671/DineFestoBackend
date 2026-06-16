@@ -5,17 +5,17 @@ const employeeController = require('../controllers/employee.controller');
 const router = express.Router();
 
 // Employee Portal routes - must come BEFORE parameterized routes
-router.get('/dashboard', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeDashboard);
-router.get('/profile', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeProfile);
-router.get('/attendance', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeAttendance);
-router.post('/attendance/check-in', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.checkIn);
-router.post('/attendance/check-out', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.checkOut);
-router.get('/schedule', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeSchedule);
-router.get('/leave/balance', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeLeaveBalance);
+router.get('/dashboard', authenticate, authorize('WAITER'), employeeController.getEmployeeDashboard);
+router.get('/profile', authenticate, authorize('WAITER'), employeeController.getEmployeeProfile);
+router.get('/attendance', authenticate, authorize('WAITER'), employeeController.getEmployeeAttendance);
+router.post('/attendance/check-in', authenticate, authorize('WAITER'), employeeController.checkIn);
+router.post('/attendance/check-out', authenticate, authorize('WAITER'), employeeController.checkOut);
+router.get('/schedule', authenticate, authorize('WAITER'), employeeController.getEmployeeSchedule);
+router.get('/leave/balance', authenticate, authorize('WAITER'), employeeController.getEmployeeLeaveBalance);
 router.get('/leave/balances', authenticate, authorize('ADMIN', 'MANAGER'), employeeController.getAllEmployeeLeaveBalances);
-router.get('/leave', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.getEmployeeLeaveRequests);
-router.post('/leave', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.createLeaveRequest);
-router.delete('/leave/:id', authenticate, authorize('MANAGER', 'WAITER', 'CHEF'), employeeController.deleteLeaveRequest);
+router.get('/leave', authenticate, authorize('WAITER'), employeeController.getEmployeeLeaveRequests);
+router.post('/leave', authenticate, authorize('WAITER'), employeeController.createLeaveRequest);
+router.delete('/leave/:id', authenticate, authorize('WAITER'), employeeController.deleteLeaveRequest);
 
 // Leave management routes (Admin/Manager only)
 router.get('/leave/all', authenticate, authorize('ADMIN', 'MANAGER'), employeeController.getAllLeaveRequests);

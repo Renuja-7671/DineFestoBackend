@@ -9,7 +9,7 @@ router.get('/', authenticate, orderController.getAllOrders);
 router.get('/stats', authenticate, authorize('ADMIN', 'MANAGER'), orderController.getOrderStats);
 router.get('/:id', authenticate, orderController.getOrderById);
 router.post('/', authenticate, orderController.createOrder);
-router.patch('/:id/attend', authenticate, authorize('WAITER', 'MANAGER'), orderController.attendOrder);
+router.patch('/:id/attend', authenticate, authorize('WAITER'), orderController.attendOrder);
 router.put('/:id/cancel', authenticate, orderController.cancelOrder);
 router.put('/:id', authenticate, authorize('ADMIN', 'MANAGER', 'WAITER'), orderController.updateOrder);
 router.put('/:id/status', authenticate, authorize('ADMIN', 'MANAGER', 'WAITER', 'CHEF'), orderController.updateOrderStatus);

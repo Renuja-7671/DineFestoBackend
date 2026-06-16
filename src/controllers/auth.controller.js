@@ -209,9 +209,9 @@ const createEmployee = async (req, res, next) => {
     }
 
     // Validate role
-    const validRoles = ['MANAGER', 'WAITER', 'CHEF'];
+    const validRoles = ['WAITER', 'CHEF'];
     if (!validRoles.includes(role)) {
-      return errorResponse(res, 'Invalid employee role', 400);
+      return errorResponse(res, 'Invalid employee role. Must be WAITER or CHEF', 400);
     }
 
     // Hash password

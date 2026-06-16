@@ -1,5 +1,6 @@
 const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
+const { STAFF_ROLES, EMPLOYEE_CREATABLE_ROLES } = require('../constants/roles');
 const {
   getEmployeeLeaveBalance,
   getAllEmployeeLeaveBalances,
@@ -10,8 +11,10 @@ const {
   buildCheckOutLocationData,
   getAttendanceLocationPolicy,
 } = require('../services/attendanceLocation.service');
-
-const STAFF_ROLES = ['MANAGER', 'WAITER', 'CHEF'];
+const {
+  evaluateCheckInTiming,
+  getFlexiHoursPolicy,
+} = require('../services/attendanceSchedule.service');
 
 const mapEmployeeForResponse = (emp) => {
   const { passwordHash, employeeProfile, ...rest } = emp;
@@ -204,11 +207,11 @@ exports.createEmployee = async (req, res) => {
     }
 
     // Validate role
-    const validRoles = ['ADMIN', 'MANAGER', 'WAITER', 'CHEF'];
+    const validRoles = EMPLOYEE_CREATABLE_ROLES;
     if (!validRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid role. Must be ADMIN, MANAGER, WAITER, or CHEF',
+        message: 'Invalid role. Must be WAITER or CHEF',
       });
     }
 
@@ -317,6 +320,13 @@ exports.updateEmployee = async (req, res) => {
           message: 'Email already exists',
         });
       }
+    }
+
+    if (role !== undefined && !EMPLOYEE_CREATABLE_ROLES.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid role. Must be WAITER or CHEF',
+      });
     }
 
     // Prepare user update data
@@ -478,8 +488,9 @@ exports.getEmployeeStats = async (req, res) => {
       where: { role: { not: 'CUSTOMER' }, isActive: true },
     });
 
-    const adminCount = await prisma.user.count({ where: { role: 'ADMIN', isActive: true } });
-    const managerCount = await prisma.user.count({ where: { role: 'MANAGER', isActive: true } });
+    const adminCount = await prisma.user.count({
+      where: { role: { in: ['ADMIN', 'MANAGER'] }, isActive: true },
+    });
     const waiterCount = await prisma.user.count({ where: { role: 'WAITER', isActive: true } });
     const chefCount = await prisma.user.count({ where: { role: 'CHEF', isActive: true } });
 
@@ -491,7 +502,6 @@ exports.getEmployeeStats = async (req, res) => {
         inactiveEmployees: totalEmployees - activeEmployees,
         byRole: {
           admin: adminCount,
-          manager: managerCount,
           waiter: waiterCount,
           chef: chefCount,
         },
@@ -781,6 +791,7 @@ exports.getEmployeeAttendance = async (req, res) => {
           totalWorkingHours: Math.round(totalWorkingHours * 10) / 10,
         },
         locationPolicy: getAttendanceLocationPolicy(),
+        flexiHoursPolicy: getFlexiHoursPolicy(),
       },
     });
   } catch (error) {
@@ -829,30 +840,8 @@ exports.checkIn = async (req, res) => {
       });
     }
 
-    // Determine status based on time
-    // Shop hours: 6:00 AM - 10:00 PM
     const now = new Date();
-    const expectedCheckInTime = new Date(today);
-    expectedCheckInTime.setHours(6, 0, 0, 0); // Shop opens at 6 AM
-    
-    // Determine which shift the employee should be on
-    const currentHour = now.getHours();
-    let shiftStartHour = 6;
-    
-    // Morning shift: 6 AM - 2 PM
-    // Afternoon shift: 2 PM - 10 PM
-    if (currentHour >= 14) {
-      shiftStartHour = 14; // 2 PM
-    }
-    
-    const shiftStartTime = new Date(today);
-    shiftStartTime.setHours(shiftStartHour, 0, 0, 0);
-    
-    // Allow 15-minute grace period for check-in
-    const lateThreshold = new Date(shiftStartTime);
-    lateThreshold.setMinutes(15);
-    
-    const status = now > lateThreshold ? 'LATE' : 'PRESENT';
+    const { status, shiftStartTime, lateThresholdTime, graceMinutes } = evaluateCheckInTiming(now);
 
     let locationData;
     try {
@@ -896,6 +885,12 @@ exports.checkIn = async (req, res) => {
       message: 'Checked in successfully',
       data: attendance,
       locationVerification: locationData.verification,
+      timing: {
+        status,
+        shiftStartTime,
+        lateThresholdTime,
+        graceMinutes,
+      },
     });
   } catch (error) {
     console.error('Error checking in:', error);
