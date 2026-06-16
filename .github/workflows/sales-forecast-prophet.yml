@@ -1,0 +1,48 @@
+name: Sales Forecast (Prophet)
+
+on:
+  # Daily at 02:00 UTC — adjust to your timezone if needed
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Manual run: GitHub → Actions → Sales Forecast (Prophet) → Run workflow
+  workflow_dispatch:
+
+concurrency:
+  group: sales-forecast-prophet
+  cancel-in-progress: false
+
+jobs:
+  train-forecast:
+    name: Train Prophet model
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/forecasting/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r forecasting/requirements.txt
+
+      - name: Run Prophet forecast training
+        env:
+          # Use your Supabase DIRECT connection string (port 5432), not the pooler URL.
+          # GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FORECAST_DAYS: ${{ vars.FORECAST_DAYS }}
+          FORECAST_MODEL_VERSION: ${{ vars.FORECAST_MODEL_VERSION }}
+        run: python forecasting/train_sales_forecast.py
