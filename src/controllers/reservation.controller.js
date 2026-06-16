@@ -1,9 +1,12 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../config/database');
 const stripeService = require('../services/stripe.service');
-
-const RESERVATION_AMOUNT_PER_GUEST = Number(process.env.RESERVATION_AMOUNT_PER_GUEST || 1000);
-const ACTIVE_RESERVATION_STATUSES = ['PENDING', 'CONFIRMED', 'SEATED'];
+const {
+  TOTAL_TABLES,
+  MAX_GUESTS_PER_TABLE,
+  RESERVATION_AMOUNT_PER_GUEST,
+  ACTIVE_RESERVATION_STATUSES,
+  DURATION_OPTIONS_MINUTES,
+} = require('../constants/reservation.constants');
 
 const roundMoney = value => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 
@@ -19,6 +22,113 @@ const calculateReservationAmounts = guestCount => {
   };
 };
 
+const getReservationEndTime = (startTime, durationMinutes) =>
+  new Date(startTime.getTime() + durationMinutes * 60 * 1000);
+
+const reservationsOverlap = (startA, durationA, startB, durationB) => {
+  const endA = getReservationEndTime(startA, durationA);
+  const endB = getReservationEndTime(startB, durationB);
+  return startA < endB && startB < endA;
+};
+
+const validateGuestCount = guestCount => {
+  const guests = parseInt(guestCount, 10);
+  if (Number.isNaN(guests) || guests < 1) {
+    return { valid: false, message: 'Guest count must be at least 1' };
+  }
+  if (guests > MAX_GUESTS_PER_TABLE) {
+    return {
+      valid: false,
+      message: `Maximum ${MAX_GUESTS_PER_TABLE} guests per table. Please reduce party size or book multiple tables separately.`,
+    };
+  }
+  return { valid: true, guests };
+};
+
+const validateDuration = durationMinutes => {
+  const duration = parseInt(durationMinutes, 10);
+  if (Number.isNaN(duration) || !DURATION_OPTIONS_MINUTES.includes(duration)) {
+    return {
+      valid: false,
+      message: `Duration must be one of: ${DURATION_OPTIONS_MINUTES.map(m => `${m / 60}h`).join(', ')}`,
+    };
+  }
+  return { valid: true, duration };
+};
+
+const validateTableNumber = tableNumber => {
+  const table = parseInt(tableNumber, 10);
+  if (Number.isNaN(table) || table < 1 || table > TOTAL_TABLES) {
+    return {
+      valid: false,
+      message: `Table number must be between 1 and ${TOTAL_TABLES}`,
+    };
+  }
+  return { valid: true, table };
+};
+
+const getOverlappingReservations = async (reservationDateTime, durationMinutes, excludeReservationId = null) => {
+  const dayStart = new Date(reservationDateTime);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(reservationDateTime);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  const where = {
+    status: { in: ACTIVE_RESERVATION_STATUSES },
+    reservationTime: { gte: dayStart, lte: dayEnd },
+  };
+
+  if (excludeReservationId) {
+    where.reservationId = { not: excludeReservationId };
+  }
+
+  return prisma.reservation.findMany({ where });
+};
+
+const isTableAvailable = async (tableNumber, reservationDateTime, durationMinutes, excludeReservationId = null) => {
+  const overlapping = await getOverlappingReservations(
+    reservationDateTime,
+    durationMinutes,
+    excludeReservationId
+  );
+
+  return !overlapping.some(existing =>
+    existing.tableNumber === tableNumber &&
+    reservationsOverlap(
+      reservationDateTime,
+      durationMinutes,
+      existing.reservationTime,
+      existing.durationMinutes || 120
+    )
+  );
+};
+
+const getAvailableTableNumbers = async (reservationDateTime, durationMinutes, excludeReservationId = null) => {
+  const overlapping = await getOverlappingReservations(
+    reservationDateTime,
+    durationMinutes,
+    excludeReservationId
+  );
+
+  const available = [];
+  for (let tableNumber = 1; tableNumber <= TOTAL_TABLES; tableNumber += 1) {
+    const blocked = overlapping.some(existing =>
+      existing.tableNumber === tableNumber &&
+      reservationsOverlap(
+        reservationDateTime,
+        durationMinutes,
+        existing.reservationTime,
+        existing.durationMinutes || 120
+      )
+    );
+    if (!blocked) {
+      available.push(tableNumber);
+    }
+  }
+
+  return available;
+};
+
 const resolveCustomerId = async (req, customerIdFromBody) => {
   if (req.user.role === 'CUSTOMER') {
     if (!req.user.customerProfile || !req.user.customerProfile.customerId) {
@@ -28,56 +138,17 @@ const resolveCustomerId = async (req, customerIdFromBody) => {
     return req.user.customerProfile.customerId;
   }
 
-  return customerIdFromBody ? parseInt(customerIdFromBody) : null;
-};
-
-const findAvailableTableNumber = async (reservationDateTime, requestedTableNumber = null) => {
-  const twoHoursBefore = new Date(reservationDateTime.getTime() - 2 * 60 * 60 * 1000);
-  const twoHoursAfter = new Date(reservationDateTime.getTime() + 2 * 60 * 60 * 1000);
-
-  const isTableAvailable = async tableNumber => {
-    const existingReservation = await prisma.reservation.findFirst({
-      where: {
-        tableNumber,
-        status: {
-          in: ACTIVE_RESERVATION_STATUSES,
-        },
-        reservationTime: {
-          gte: twoHoursBefore,
-          lte: twoHoursAfter,
-        },
-      },
-    });
-
-    return !existingReservation;
-  };
-
-  if (requestedTableNumber) {
-    const parsedTableNumber = parseInt(requestedTableNumber);
-    if (await isTableAvailable(parsedTableNumber)) {
-      return parsedTableNumber;
-    }
-  }
-
-  for (let tableNumber = 1; tableNumber <= 20; tableNumber += 1) {
-    if (await isTableAvailable(tableNumber)) {
-      return tableNumber;
-    }
-  }
-
-  throw new Error('No tables are available for the selected time slot');
+  return customerIdFromBody ? parseInt(customerIdFromBody, 10) : null;
 };
 
 // Get all reservations
 exports.getAllReservations = async (req, res) => {
   try {
     const { status, date, customerId } = req.query;
-    
+
     const where = {};
     if (status) where.status = status;
-    
-    // If user is a CUSTOMER, only show their own reservations
-    // If user is ADMIN/MANAGER, they can see all or filter by customerId
+
     if (req.user.role === 'CUSTOMER') {
       if (req.user.customerProfile && req.user.customerProfile.customerId) {
         where.customerId = req.user.customerProfile.customerId;
@@ -88,17 +159,15 @@ exports.getAllReservations = async (req, res) => {
         });
       }
     } else if (customerId) {
-      // Admin/Manager can filter by specific customer
-      where.customerId = parseInt(customerId);
+      where.customerId = parseInt(customerId, 10);
     }
-    
-    // Filter by date (reservations on specific date)
+
     if (date) {
       const startOfDay = new Date(date);
       startOfDay.setHours(0, 0, 0, 0);
       const endOfDay = new Date(date);
       endOfDay.setHours(23, 59, 59, 999);
-      
+
       where.reservationTime = {
         gte: startOfDay,
         lte: endOfDay,
@@ -133,13 +202,25 @@ exports.getAllReservations = async (req, res) => {
   }
 };
 
+exports.getReservationConfig = async (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      totalTables: TOTAL_TABLES,
+      maxGuestsPerTable: MAX_GUESTS_PER_TABLE,
+      amountPerGuest: RESERVATION_AMOUNT_PER_GUEST,
+      durationOptionsMinutes: DURATION_OPTIONS_MINUTES,
+    },
+  });
+};
+
 // Get single reservation by ID
 exports.getReservationById = async (req, res) => {
   try {
     const { id } = req.params;
 
     const reservation = await prisma.reservation.findUnique({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
       include: {
         customer: {
           include: {
@@ -156,10 +237,11 @@ exports.getReservationById = async (req, res) => {
       });
     }
 
-    // If user is a CUSTOMER, only allow viewing their own reservations
     if (req.user.role === 'CUSTOMER') {
-      if (!req.user.customerProfile || 
-          req.user.customerProfile.customerId !== reservation.customerId) {
+      if (
+        !req.user.customerProfile ||
+        req.user.customerProfile.customerId !== reservation.customerId
+      ) {
         return res.status(403).json({
           success: false,
           message: 'Access denied. You can only view your own reservations.',
@@ -184,37 +266,76 @@ exports.getReservationById = async (req, res) => {
 // Create new reservation
 exports.createReservation = async (req, res) => {
   try {
-    let { customerId, tableNumber, reservationTime, guestCount, numberOfGuests } = req.body;
+    let {
+      customerId,
+      tableNumber,
+      reservationTime,
+      guestCount,
+      numberOfGuests,
+      durationMinutes,
+      guestName,
+      guestPhone,
+      status,
+    } = req.body;
 
-    // Accept both guestCount (legacy) and numberOfGuests (current API)
-    const guests = parseInt(numberOfGuests || guestCount);
-    customerId = await resolveCustomerId(req, customerId);
+    const guestValidation = validateGuestCount(numberOfGuests || guestCount);
+    if (!guestValidation.valid) {
+      return res.status(400).json({ success: false, message: guestValidation.message });
+    }
+    const guests = guestValidation.guests;
 
-    // Validate required fields
-    if (!customerId || !reservationTime || !guests) {
+    const durationValidation = validateDuration(durationMinutes || 120);
+    if (!durationValidation.valid) {
+      return res.status(400).json({ success: false, message: durationValidation.message });
+    }
+    const duration = durationValidation.duration;
+
+    const tableValidation = validateTableNumber(tableNumber);
+    if (!tableValidation.valid) {
+      return res.status(400).json({ success: false, message: tableValidation.message });
+    }
+    const parsedTableNumber = tableValidation.table;
+
+    const isStaffUser = ['ADMIN', 'MANAGER'].includes(req.user.role);
+
+    if (isStaffUser) {
+      customerId = customerId ? parseInt(customerId, 10) : null;
+    } else {
+      customerId = await resolveCustomerId(req, customerId);
+    }
+
+    if (!reservationTime) {
       return res.status(400).json({
         success: false,
-        message: 'Reservation time and guest count are required',
+        message: 'Reservation time is required',
       });
     }
 
-    if (guests <= 0) {
+    if (isStaffUser && !customerId && (!guestName || guestName.trim() === '')) {
       return res.status(400).json({
         success: false,
-        message: 'Guest count must be at least 1',
+        message: 'Customer ID or guest name is required',
       });
     }
 
-    // Check if customer exists
-    const customer = await prisma.customer.findUnique({
-      where: { customerId: parseInt(customerId) },
-    });
-
-    if (!customer) {
-      return res.status(404).json({
+    if (!isStaffUser && !customerId) {
+      return res.status(400).json({
         success: false,
-        message: 'Customer not found',
+        message: 'Customer profile is required',
       });
+    }
+
+    if (customerId) {
+      const customer = await prisma.customer.findUnique({
+        where: { customerId },
+      });
+
+      if (!customer) {
+        return res.status(404).json({
+          success: false,
+          message: 'Customer not found',
+        });
+      }
     }
 
     const reservationDateTime = new Date(reservationTime);
@@ -226,16 +347,34 @@ exports.createReservation = async (req, res) => {
       });
     }
 
-    const assignedTableNumber = await findAvailableTableNumber(reservationDateTime, tableNumber);
+    if (reservationDateTime <= new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Reservation time must be in the future',
+      });
+    }
+
+    const tableAvailable = await isTableAvailable(parsedTableNumber, reservationDateTime, duration);
+    if (!tableAvailable) {
+      return res.status(400).json({
+        success: false,
+        message: `Table ${parsedTableNumber} is not available for the selected date, time, and duration`,
+      });
+    }
+
     const { reservationAmount } = calculateReservationAmounts(guests);
+    const reservationStatus = isStaffUser && status ? status : 'PENDING';
 
     const reservation = await prisma.reservation.create({
       data: {
-        customerId: parseInt(customerId),
-        tableNumber: assignedTableNumber,
+        customerId,
+        guestName: !customerId ? guestName?.trim() : null,
+        guestPhone: !customerId ? guestPhone?.trim() || null : null,
+        tableNumber: parsedTableNumber,
         reservationTime: reservationDateTime,
+        durationMinutes: duration,
         guestCount: guests,
-        status: 'PENDING', // Start as PENDING, admin can confirm
+        status: reservationStatus,
         reservationAmount,
         onlinePaidAmount: 0,
         remainingAmount: reservationAmount,
@@ -253,17 +392,13 @@ exports.createReservation = async (req, res) => {
     res.status(201).json({
       success: true,
       message: 'Reservation created successfully',
-      data: reservation,
+      data: {
+        ...reservation,
+        amountDue: reservationAmount,
+      },
     });
   } catch (error) {
     console.error('Error creating reservation:', error);
-
-    if (error.message === 'No tables are available for the selected time slot') {
-      return res.status(400).json({
-        success: false,
-        message: error.message,
-      });
-    }
 
     if (error.message === 'Customer profile not found') {
       return res.status(400).json({
@@ -282,26 +417,36 @@ exports.createReservation = async (req, res) => {
 
 exports.createReservationPaymentIntent = async (req, res) => {
   try {
-    let { customerId, reservationTime, guestCount, numberOfGuests } = req.body;
-    const guests = parseInt(numberOfGuests || guestCount);
+    let { customerId, reservationTime, guestCount, numberOfGuests, durationMinutes, tableNumber } = req.body;
+    const guests = parseInt(numberOfGuests || guestCount, 10);
     customerId = await resolveCustomerId(req, customerId);
 
-    if (!customerId || !reservationTime || !guests) {
-      return res.status(400).json({
-        success: false,
-        message: 'Reservation time and guest count are required',
-      });
+    const guestValidation = validateGuestCount(guests);
+    if (!guestValidation.valid) {
+      return res.status(400).json({ success: false, message: guestValidation.message });
     }
 
-    if (guests <= 0) {
+    const durationValidation = validateDuration(durationMinutes || 120);
+    if (!durationValidation.valid) {
+      return res.status(400).json({ success: false, message: durationValidation.message });
+    }
+    const duration = durationValidation.duration;
+
+    const tableValidation = validateTableNumber(tableNumber);
+    if (!tableValidation.valid) {
+      return res.status(400).json({ success: false, message: tableValidation.message });
+    }
+    const parsedTableNumber = tableValidation.table;
+
+    if (!customerId || !reservationTime) {
       return res.status(400).json({
         success: false,
-        message: 'Guest count must be at least 1',
+        message: 'Reservation time and table are required',
       });
     }
 
     const customer = await prisma.customer.findUnique({
-      where: { customerId: parseInt(customerId) },
+      where: { customerId: parseInt(customerId, 10) },
     });
 
     if (!customer) {
@@ -320,8 +465,13 @@ exports.createReservationPaymentIntent = async (req, res) => {
       });
     }
 
-    // Validate that at least one table is available before accepting payment.
-    await findAvailableTableNumber(reservationDateTime);
+    const tableAvailable = await isTableAvailable(parsedTableNumber, reservationDateTime, duration);
+    if (!tableAvailable) {
+      return res.status(400).json({
+        success: false,
+        message: `Table ${parsedTableNumber} is no longer available. Please select another table.`,
+      });
+    }
 
     const {
       reservationAmount,
@@ -336,6 +486,8 @@ exports.createReservationPaymentIntent = async (req, res) => {
         type: 'reservation_advance',
         customerId: String(customerId),
         guestCount: String(guests),
+        tableNumber: String(parsedTableNumber),
+        durationMinutes: String(duration),
         reservationTime: reservationDateTime.toISOString(),
       }
     );
@@ -362,10 +514,7 @@ exports.createReservationPaymentIntent = async (req, res) => {
       });
     }
 
-    if (
-      error.message === 'No tables are available for the selected time slot' ||
-      error.message === 'Customer profile not found'
-    ) {
+    if (error.message === 'Customer profile not found') {
       return res.status(400).json({
         success: false,
         message: error.message,
@@ -383,8 +532,15 @@ exports.createReservationPaymentIntent = async (req, res) => {
 exports.confirmReservationWithPayment = async (req, res) => {
   try {
     const { paymentIntentId, reservationData } = req.body;
-    let { customerId, tableNumber, reservationTime, guestCount, numberOfGuests } = reservationData || {};
-    const guests = parseInt(numberOfGuests || guestCount);
+    let {
+      customerId,
+      tableNumber,
+      reservationTime,
+      guestCount,
+      numberOfGuests,
+      durationMinutes,
+    } = reservationData || {};
+    const guests = parseInt(numberOfGuests || guestCount, 10);
     customerId = await resolveCustomerId(req, customerId);
 
     if (!paymentIntentId) {
@@ -394,15 +550,32 @@ exports.confirmReservationWithPayment = async (req, res) => {
       });
     }
 
-    if (!customerId || !reservationTime || !guests) {
+    const guestValidation = validateGuestCount(guests);
+    if (!guestValidation.valid) {
+      return res.status(400).json({ success: false, message: guestValidation.message });
+    }
+
+    const durationValidation = validateDuration(durationMinutes || 120);
+    if (!durationValidation.valid) {
+      return res.status(400).json({ success: false, message: durationValidation.message });
+    }
+    const duration = durationValidation.duration;
+
+    const tableValidation = validateTableNumber(tableNumber);
+    if (!tableValidation.valid) {
+      return res.status(400).json({ success: false, message: tableValidation.message });
+    }
+    const parsedTableNumber = tableValidation.table;
+
+    if (!customerId || !reservationTime) {
       return res.status(400).json({
         success: false,
-        message: 'Reservation time and guest count are required',
+        message: 'Reservation time and table are required',
       });
     }
 
     const customer = await prisma.customer.findUnique({
-      where: { customerId: parseInt(customerId) },
+      where: { customerId: parseInt(customerId, 10) },
     });
 
     if (!customer) {
@@ -430,6 +603,14 @@ exports.confirmReservationWithPayment = async (req, res) => {
       });
     }
 
+    const tableAvailable = await isTableAvailable(parsedTableNumber, reservationDateTime, duration);
+    if (!tableAvailable) {
+      return res.status(400).json({
+        success: false,
+        message: `Table ${parsedTableNumber} is no longer available. Please select another table.`,
+      });
+    }
+
     const {
       reservationAmount,
       onlinePaymentAmount,
@@ -443,15 +624,14 @@ exports.confirmReservationWithPayment = async (req, res) => {
       });
     }
 
-    const assignedTableNumber = await findAvailableTableNumber(reservationDateTime, tableNumber);
-
     const reservation = await prisma.reservation.create({
       data: {
-        customerId: parseInt(customerId),
-        tableNumber: assignedTableNumber,
+        customerId: parseInt(customerId, 10),
+        tableNumber: parsedTableNumber,
         reservationTime: reservationDateTime,
+        durationMinutes: duration,
         guestCount: guests,
-        status: 'PENDING',
+        status: 'CONFIRMED',
         reservationAmount,
         onlinePaidAmount: onlinePaymentAmount,
         remainingAmount,
@@ -476,7 +656,6 @@ exports.confirmReservationWithPayment = async (req, res) => {
     console.error('Error confirming reservation with payment:', error);
 
     if (
-      error.message === 'No tables are available for the selected time slot' ||
       error.message === 'Customer profile not found'
     ) {
       return res.status(400).json({
@@ -493,15 +672,12 @@ exports.confirmReservationWithPayment = async (req, res) => {
   }
 };
 
-// Update reservation
-exports.updateReservation = async (req, res) => {
+exports.recordPhysicalPayment = async (req, res) => {
   try {
     const { id } = req.params;
-    const { tableNumber, reservationTime, guestCount, status } = req.body;
 
-    // Check if reservation exists
     const existingReservation = await prisma.reservation.findUnique({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
     });
 
     if (!existingReservation) {
@@ -511,42 +687,180 @@ exports.updateReservation = async (req, res) => {
       });
     }
 
-    // If updating table or time, check for conflicts
-    if (tableNumber || reservationTime) {
-      const newTableNumber = tableNumber ? parseInt(tableNumber) : existingReservation.tableNumber;
-      const newReservationTime = reservationTime ? new Date(reservationTime) : existingReservation.reservationTime;
-      
-      const twoHoursBefore = new Date(newReservationTime.getTime() - 2 * 60 * 60 * 1000);
-      const twoHoursAfter = new Date(newReservationTime.getTime() + 2 * 60 * 60 * 1000);
+    if (existingReservation.paymentStatus === 'PAID') {
+      return res.status(400).json({
+        success: false,
+        message: 'Reservation is already fully paid',
+      });
+    }
 
-      const conflictingReservation = await prisma.reservation.findFirst({
-        where: {
-          reservationId: { not: parseInt(id) },
-          tableNumber: newTableNumber,
-          status: 'CONFIRMED',
-          reservationTime: {
-            gte: twoHoursBefore,
-            lte: twoHoursAfter,
+    const reservationAmount = Number(existingReservation.reservationAmount);
+
+    const reservation = await prisma.reservation.update({
+      where: { reservationId: parseInt(id, 10) },
+      data: {
+        remainingAmount: 0,
+        paymentStatus: 'PAID',
+      },
+      include: {
+        customer: {
+          include: {
+            user: true,
           },
         },
-      });
+      },
+    });
 
-      if (conflictingReservation) {
+    res.json({
+      success: true,
+      message: 'Physical payment recorded successfully',
+      data: reservation,
+    });
+  } catch (error) {
+    console.error('Error recording physical payment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record physical payment',
+      error: error.message,
+    });
+  }
+};
+
+exports.recordOnlinePayment = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const existingReservation = await prisma.reservation.findUnique({
+      where: { reservationId: parseInt(id, 10) },
+    });
+
+    if (!existingReservation) {
+      return res.status(404).json({
+        success: false,
+        message: 'Reservation not found',
+      });
+    }
+
+    if (Number(existingReservation.onlinePaidAmount) > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Online payment has already been recorded',
+      });
+    }
+
+    const { onlinePaymentAmount, remainingAmount } = calculateReservationAmounts(
+      existingReservation.guestCount
+    );
+
+    const reservation = await prisma.reservation.update({
+      where: { reservationId: parseInt(id, 10) },
+      data: {
+        onlinePaidAmount: onlinePaymentAmount,
+        remainingAmount,
+        paymentStatus: 'PARTIAL',
+        status: existingReservation.status === 'PENDING' ? 'CONFIRMED' : existingReservation.status,
+      },
+      include: {
+        customer: {
+          include: {
+            user: true,
+          },
+        },
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Online payment recorded successfully',
+      data: reservation,
+    });
+  } catch (error) {
+    console.error('Error recording online payment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record online payment',
+      error: error.message,
+    });
+  }
+};
+
+// Update reservation
+exports.updateReservation = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { tableNumber, reservationTime, guestCount, durationMinutes, status } = req.body;
+
+    const existingReservation = await prisma.reservation.findUnique({
+      where: { reservationId: parseInt(id, 10) },
+    });
+
+    if (!existingReservation) {
+      return res.status(404).json({
+        success: false,
+        message: 'Reservation not found',
+      });
+    }
+
+    const newTableNumber = tableNumber !== undefined
+      ? parseInt(tableNumber, 10)
+      : existingReservation.tableNumber;
+    const newReservationTime = reservationTime
+      ? new Date(reservationTime)
+      : existingReservation.reservationTime;
+    const newDuration = durationMinutes !== undefined
+      ? parseInt(durationMinutes, 10)
+      : existingReservation.durationMinutes || 120;
+    const newGuestCount = guestCount !== undefined
+      ? parseInt(guestCount, 10)
+      : existingReservation.guestCount;
+
+    if (guestCount !== undefined) {
+      const guestValidation = validateGuestCount(newGuestCount);
+      if (!guestValidation.valid) {
+        return res.status(400).json({ success: false, message: guestValidation.message });
+      }
+    }
+
+    if (durationMinutes !== undefined) {
+      const durationValidation = validateDuration(newDuration);
+      if (!durationValidation.valid) {
+        return res.status(400).json({ success: false, message: durationValidation.message });
+      }
+    }
+
+    if (tableNumber !== undefined || reservationTime !== undefined || durationMinutes !== undefined) {
+      const tableAvailable = await isTableAvailable(
+        newTableNumber,
+        newReservationTime,
+        newDuration,
+        parseInt(id, 10)
+      );
+
+      if (!tableAvailable) {
         return res.status(400).json({
           success: false,
-          message: 'Table is already reserved for this time slot',
+          message: 'Table is not available for the selected date, time, and duration',
         });
       }
     }
 
     const updateData = {};
-    if (tableNumber !== undefined) updateData.tableNumber = parseInt(tableNumber);
-    if (reservationTime !== undefined) updateData.reservationTime = new Date(reservationTime);
-    if (guestCount !== undefined) updateData.guestCount = parseInt(guestCount);
+    if (tableNumber !== undefined) updateData.tableNumber = newTableNumber;
+    if (reservationTime !== undefined) updateData.reservationTime = newReservationTime;
+    if (guestCount !== undefined) {
+      updateData.guestCount = newGuestCount;
+      const { reservationAmount, remainingAmount } = calculateReservationAmounts(newGuestCount);
+      updateData.reservationAmount = reservationAmount;
+      updateData.remainingAmount = roundMoney(
+        reservationAmount - Number(existingReservation.onlinePaidAmount)
+      );
+      if (updateData.remainingAmount < 0) updateData.remainingAmount = 0;
+    }
+    if (durationMinutes !== undefined) updateData.durationMinutes = newDuration;
     if (status !== undefined) updateData.status = status;
 
     const reservation = await prisma.reservation.update({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
       data: updateData,
       include: {
         customer: {
@@ -578,7 +892,7 @@ exports.cancelReservation = async (req, res) => {
     const { id } = req.params;
 
     const existingReservation = await prisma.reservation.findUnique({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
     });
 
     if (!existingReservation) {
@@ -588,10 +902,11 @@ exports.cancelReservation = async (req, res) => {
       });
     }
 
-    // If user is a CUSTOMER, only allow canceling their own reservations
     if (req.user.role === 'CUSTOMER') {
-      if (!req.user.customerProfile || 
-          req.user.customerProfile.customerId !== existingReservation.customerId) {
+      if (
+        !req.user.customerProfile ||
+        req.user.customerProfile.customerId !== existingReservation.customerId
+      ) {
         return res.status(403).json({
           success: false,
           message: 'Access denied. You can only cancel your own reservations.',
@@ -600,7 +915,7 @@ exports.cancelReservation = async (req, res) => {
     }
 
     const reservation = await prisma.reservation.update({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
       data: { status: 'CANCELLED' },
       include: {
         customer: {
@@ -632,7 +947,7 @@ exports.deleteReservation = async (req, res) => {
     const { id } = req.params;
 
     const existingReservation = await prisma.reservation.findUnique({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
     });
 
     if (!existingReservation) {
@@ -643,7 +958,7 @@ exports.deleteReservation = async (req, res) => {
     }
 
     await prisma.reservation.delete({
-      where: { reservationId: parseInt(id) },
+      where: { reservationId: parseInt(id, 10) },
     });
 
     res.json({
@@ -669,7 +984,7 @@ exports.getReservationStats = async (req, res) => {
     tomorrow.setDate(tomorrow.getDate() + 1);
 
     const totalReservations = await prisma.reservation.count();
-    
+
     const todayReservations = await prisma.reservation.count({
       where: {
         reservationTime: {
@@ -712,10 +1027,10 @@ exports.getReservationStats = async (req, res) => {
   }
 };
 
-// Get available tables for a specific time
+// Get available tables for a specific time and duration
 exports.getAvailableTables = async (req, res) => {
   try {
-    const { reservationTime } = req.query;
+    const { reservationTime, durationMinutes } = req.query;
 
     if (!reservationTime) {
       return res.status(400).json({
@@ -724,33 +1039,27 @@ exports.getAvailableTables = async (req, res) => {
       });
     }
 
+    const durationValidation = validateDuration(durationMinutes || 120);
+    if (!durationValidation.valid) {
+      return res.status(400).json({ success: false, message: durationValidation.message });
+    }
+    const duration = durationValidation.duration;
+
     const requestedTime = new Date(reservationTime);
-    const twoHoursBefore = new Date(requestedTime.getTime() - 2 * 60 * 60 * 1000);
-    const twoHoursAfter = new Date(requestedTime.getTime() + 2 * 60 * 60 * 1000);
 
-    // Get all reserved tables for this time window
-    const reservedTables = await prisma.reservation.findMany({
-      where: {
-        status: 'CONFIRMED',
-        reservationTime: {
-          gte: twoHoursBefore,
-          lte: twoHoursAfter,
-        },
-      },
-      select: {
-        tableNumber: true,
-      },
-    });
+    if (Number.isNaN(requestedTime.getTime())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid reservation time',
+      });
+    }
 
-    const reservedTableNumbers = reservedTables.map(r => r.tableNumber);
-    
-    // Assuming tables 1-20 exist (you can modify this based on your setup)
-    const totalTables = 20;
-    const availableTables = [];
-    
-    for (let i = 1; i <= totalTables; i++) {
-      if (!reservedTableNumbers.includes(i)) {
-        availableTables.push(i);
+    const availableTables = await getAvailableTableNumbers(requestedTime, duration);
+    const reservedTables = [];
+
+    for (let i = 1; i <= TOTAL_TABLES; i += 1) {
+      if (!availableTables.includes(i)) {
+        reservedTables.push(i);
       }
     }
 
@@ -758,7 +1067,10 @@ exports.getAvailableTables = async (req, res) => {
       success: true,
       data: {
         availableTables,
-        reservedTables: reservedTableNumbers,
+        reservedTables,
+        totalTables: TOTAL_TABLES,
+        maxGuestsPerTable: MAX_GUESTS_PER_TABLE,
+        durationMinutes: duration,
       },
     });
   } catch (error) {

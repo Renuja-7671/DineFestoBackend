@@ -12,7 +12,7 @@ const prisma = new PrismaClient();
 
 const ORDER_CONFIG = {
   customerId: 134,
-  orderType: 'DINE_IN', // DINE_IN, TAKEAWAY, ONLINE_DELIVERY
+  orderType: 'DINE_IN', // DINE_IN or TAKEAWAY
   orderStatus: 'PENDING', // PENDING, PREPARING, READY, SERVED, COMPLETED, CANCELLED
   tableNumber: 7, // null for takeaway/delivery
   

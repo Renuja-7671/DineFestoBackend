@@ -1,44 +1,53 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../config/database');
+const {
+  createLowStockAlerts,
+  createStockRestoredAlert,
+  syncMenuItemAvailability,
+} = require('../services/inventoryConsumption.service');
 
 // Get all inventory items
 exports.getAllInventoryItems = async (req, res) => {
   try {
     const { lowStock } = req.query;
-    
-    let where = {};
-    
-    // Filter for low stock items (quantity <= reorderLevel)
+
+    // When lowStock=true we filter using Prisma's field comparison support.
+    // Prisma doesn't support field-to-field comparisons directly, so we use
+    // a raw query only for the filter but still return consistent camelCase data.
+    let inventoryItems;
+
     if (lowStock === 'true') {
-      where = {
-        quantity: {
-          lte: prisma.raw('reorderLevel')
-        }
-      };
-      
-      // Alternative approach using raw query
-      const items = await prisma.$queryRaw`
-        SELECT * FROM "InventoryItem"
+      inventoryItems = await prisma.$queryRaw`
+        SELECT
+          "inventoryId",
+          "itemName",
+          quantity::float8        AS quantity,
+          unit,
+          "reorderLevel"::float8  AS "reorderLevel",
+          "costPerUnit"::float8   AS "costPerUnit",
+          "lastUpdated"
+        FROM "InventoryItem"
         WHERE quantity <= "reorderLevel"
         ORDER BY "itemName" ASC
       `;
-      
-      return res.json({
-        success: true,
-        data: items,
+    } else {
+      inventoryItems = await prisma.inventoryItem.findMany({
+        orderBy: { itemName: 'asc' },
+        include: {
+          _count: { select: { usedInRecipes: true } },
+        },
       });
     }
 
-    const inventoryItems = await prisma.inventoryItem.findMany({
-      where,
-      orderBy: {
-        itemName: 'asc',
-      },
-    });
+    // Attach the count of menu items that use each ingredient
+    const enriched = inventoryItems.map((item) => ({
+      ...item,
+      menuItemsUsingCount: item._count?.usedInRecipes ?? 0,
+      _count: undefined,
+    }));
 
     res.json({
       success: true,
-      data: inventoryItems,
+      data: enriched,
     });
   } catch (error) {
     console.error('Error fetching inventory items:', error);
@@ -181,6 +190,11 @@ exports.updateInventoryItem = async (req, res) => {
       data: updateData,
     });
 
+    // Sync menu item availability when quantity is directly edited
+    if (quantity !== undefined) {
+      await syncMenuItemAvailability([parseInt(id)]);
+    }
+
     res.json({
       success: true,
       message: 'Inventory item updated successfully',
@@ -275,11 +289,34 @@ exports.adjustInventoryQuantity = async (req, res) => {
       });
     }
 
-    const inventoryItem = await prisma.inventoryItem.update({
-      where: { inventoryId: parseInt(id) },
-      data: {
-        quantity: newQuantity,
-      },
+    const inventoryItem = await prisma.$transaction(async (tx) => {
+      const updatedItem = await tx.inventoryItem.update({
+        where: { inventoryId: parseInt(id) },
+        data: {
+          quantity: newQuantity,
+        },
+      });
+
+      await tx.inventoryLedger.create({
+        data: {
+          inventoryId: parseInt(id),
+          movementType: adjustment > 0 ? 'STOCK_IN' : 'MANUAL_ADJUSTMENT',
+          quantityChange: parseFloat(adjustment),
+          note: reason || 'Manual inventory adjustment',
+        },
+      });
+
+      // Fire low-stock or stock-restored notifications
+      if (adjustment > 0) {
+        await createStockRestoredAlert(tx, updatedItem);
+      } else {
+        await createLowStockAlerts(tx, updatedItem);
+      }
+
+      // Auto-toggle menu item availability based on new stock level
+      await syncMenuItemAvailability([parseInt(id)], tx);
+
+      return updatedItem;
     });
 
     res.json({
@@ -292,6 +329,208 @@ exports.adjustInventoryQuantity = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to adjust inventory',
+      error: error.message,
+    });
+  }
+};
+
+// Get inventory movement ledger
+exports.getInventoryLedger = async (req, res) => {
+  try {
+    const { inventoryId, orderId, movementType, limit = 100 } = req.query;
+
+    const where = {};
+    if (inventoryId) where.inventoryId = parseInt(inventoryId);
+    if (orderId) where.referenceOrderId = parseInt(orderId);
+    if (movementType) where.movementType = movementType;
+
+    const entries = await prisma.inventoryLedger.findMany({
+      where,
+      include: {
+        inventory: {
+          select: {
+            inventoryId: true,
+            itemName: true,
+            unit: true,
+          },
+        },
+        referenceOrder: {
+          select: {
+            orderId: true,
+            status: true,
+            inventoryDeductedAt: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      take: Math.min(parseInt(limit, 10) || 100, 500),
+    });
+
+    res.json({
+      success: true,
+      data: entries,
+    });
+  } catch (error) {
+    console.error('Error fetching inventory ledger:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch inventory ledger',
+      error: error.message,
+    });
+  }
+};
+
+// Get recipe by menu item id
+exports.getRecipeByMenuItem = async (req, res) => {
+  try {
+    const { menuItemId } = req.params;
+
+    const menuItem = await prisma.menuItem.findUnique({
+      where: { itemId: parseInt(menuItemId, 10) },
+      include: {
+        recipe: {
+          include: {
+            inventory: true,
+          },
+          orderBy: {
+            recipeId: 'asc',
+          },
+        },
+      },
+    });
+
+    if (!menuItem) {
+      return res.status(404).json({
+        success: false,
+        message: 'Menu item not found',
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        menuItemId: menuItem.itemId,
+        menuItemName: menuItem.name,
+        recipe: menuItem.recipe,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching recipe:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch recipe',
+      error: error.message,
+    });
+  }
+};
+
+// Replace recipe for a menu item
+exports.upsertMenuItemRecipe = async (req, res) => {
+  try {
+    const { menuItemId } = req.params;
+    const { recipeItems } = req.body;
+
+    if (!Array.isArray(recipeItems) || recipeItems.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'recipeItems must be a non-empty array',
+      });
+    }
+
+    const parsedMenuItemId = parseInt(menuItemId, 10);
+    const menuItem = await prisma.menuItem.findUnique({
+      where: { itemId: parsedMenuItemId },
+    });
+
+    if (!menuItem) {
+      return res.status(404).json({
+        success: false,
+        message: 'Menu item not found',
+      });
+    }
+
+    const normalizedRecipeItems = recipeItems.map((item) => ({
+      inventoryId: parseInt(item.inventoryId, 10),
+      quantityUsed: parseFloat(item.quantityUsed),
+    }));
+
+    const hasInvalidItems = normalizedRecipeItems.some(
+      (item) => Number.isNaN(item.inventoryId) || Number.isNaN(item.quantityUsed) || item.quantityUsed <= 0,
+    );
+
+    if (hasInvalidItems) {
+      return res.status(400).json({
+        success: false,
+        message: 'Each recipe item must include valid inventoryId and positive quantityUsed',
+      });
+    }
+
+    const uniqueInventoryIds = [...new Set(normalizedRecipeItems.map((item) => item.inventoryId))];
+    if (uniqueInventoryIds.length !== normalizedRecipeItems.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Duplicate inventory items are not allowed in a recipe',
+      });
+    }
+
+    const inventoryItems = await prisma.inventoryItem.findMany({
+      where: {
+        inventoryId: {
+          in: uniqueInventoryIds,
+        },
+      },
+      select: {
+        inventoryId: true,
+      },
+    });
+
+    if (inventoryItems.length !== uniqueInventoryIds.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'One or more inventory items do not exist',
+      });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.recipeIngredient.deleteMany({
+        where: { menuItemId: parsedMenuItemId },
+      });
+
+      await tx.recipeIngredient.createMany({
+        data: normalizedRecipeItems.map((item) => ({
+          menuItemId: parsedMenuItemId,
+          inventoryId: item.inventoryId,
+          quantityUsed: item.quantityUsed,
+        })),
+      });
+    });
+
+    const updatedRecipe = await prisma.recipeIngredient.findMany({
+      where: { menuItemId: parsedMenuItemId },
+      include: {
+        inventory: true,
+      },
+      orderBy: {
+        recipeId: 'asc',
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Recipe updated successfully',
+      data: {
+        menuItemId: parsedMenuItemId,
+        menuItemName: menuItem.name,
+        recipe: updatedRecipe,
+      },
+    });
+  } catch (error) {
+    console.error('Error updating recipe:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update recipe',
       error: error.message,
     });
   }

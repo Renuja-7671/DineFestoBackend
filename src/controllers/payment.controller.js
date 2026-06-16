@@ -5,6 +5,7 @@
 
 const stripeService = require('../services/stripe.service');
 const prisma = require('../config/database');
+const inventoryConsumptionService = require('../services/inventoryConsumption.service');
 
 /**
  * Get Stripe publishable key
@@ -107,6 +108,13 @@ exports.confirmPayment = async (req, res) => {
       });
     }
 
+    const orderType = orderData.type || 'DINE_IN';
+    if (!['DINE_IN', 'TAKEAWAY'].includes(orderType)) {
+      return res.status(400).json({
+        error: 'Invalid order type. Only DINE_IN and TAKEAWAY are supported.',
+      });
+    }
+
     // Retrieve payment intent from Stripe to verify status
     const paymentIntent = await stripeService.retrievePaymentIntent(paymentIntentId);
 
@@ -159,7 +167,7 @@ exports.confirmPayment = async (req, res) => {
       const newOrder = await tx.order.create({
         data: {
           customerId: customer.customerId,
-          type: orderData.type || 'DINE_IN',
+          type: orderType,
           status: 'PENDING',
           totalAmount: totalPrice,
           items: {
@@ -202,6 +210,9 @@ exports.confirmPayment = async (req, res) => {
       });
 
       return { ...newOrder, payment };
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     res.json({
@@ -313,18 +324,36 @@ exports.requestRefund = async (req, res) => {
       amount // If amount provided, partial refund, otherwise full refund
     );
 
-    // Update payment status
-    const updatedPayment = await prisma.payment.update({
-      where: { paymentId: parseInt(paymentId) },
-      data: {
-        status: amount && amount < payment.amount ? 'PARTIAL_REFUND' : 'REFUNDED',
-      },
-    });
+    const parsedPaymentId = parseInt(paymentId, 10);
+    const isPartialRefund = amount && amount < payment.amount;
 
-    // Update order status
-    await prisma.order.update({
-      where: { orderId: payment.orderId },
-      data: { status: 'CANCELLED' },
+    // Keep payment and inventory in sync when refunding/cancelling an order
+    const updatedPayment = await prisma.$transaction(async (tx) => {
+      const paymentRecord = await tx.payment.update({
+        where: { paymentId: parsedPaymentId },
+        data: {
+          status: isPartialRefund ? 'PARTIAL_REFUND' : 'REFUNDED',
+        },
+      });
+
+      const updatedOrder = await tx.order.update({
+        where: { orderId: payment.orderId },
+        data: { status: 'CANCELLED' },
+        select: { orderId: true, status: true },
+      });
+
+      if (updatedOrder.status === 'CANCELLED') {
+        await inventoryConsumptionService.restoreInventoryForCancelledOrder({
+          orderId: payment.orderId,
+          note: 'Inventory restored after refund cancellation',
+          tx,
+        });
+      }
+
+      return paymentRecord;
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     res.json({

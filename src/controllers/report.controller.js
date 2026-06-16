@@ -1,5 +1,17 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const { getRevenueAnalytics } = require('../services/revenueReport.service');
+const { createRevenueReportPdf } = require('../services/revenueReportPdf.service');
+const { getSalesAnalytics } = require('../services/salesReport.service');
+const { createSalesReportPdf } = require('../services/salesReportPdf.service');
+const { getCustomerAnalytics } = require('../services/customerReport.service');
+const { createCustomerReportPdf } = require('../services/customerReportPdf.service');
+const { getInventoryAnalytics } = require('../services/inventoryReport.service');
+const { createInventoryReportPdf } = require('../services/inventoryReportPdf.service');
+const { getEmployeeAnalytics } = require('../services/employeeReport.service');
+const { createEmployeeReportPdf } = require('../services/employeeReportPdf.service');
+const { getOrderTrendsAnalytics } = require('../services/orderTrendsReport.service');
+const { createOrderTrendsReportPdf } = require('../services/orderTrendsReportPdf.service');
+const { formatDateKey, toLocalDate, addDays } = require('../utils/date.utils');
+const prisma = require('../config/database');
 
 // Get dashboard overview stats
 exports.getDashboardStats = async (req, res) => {
@@ -10,67 +22,63 @@ exports.getDashboardStats = async (req, res) => {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    // Today's orders
-    const todayOrders = await prisma.order.count({
-      where: {
-        createdAt: {
-          gte: today,
-          lt: tomorrow,
+    const [
+      todayOrders,
+      todayRevenue,
+      totalCustomers,
+      todayReservations,
+      lowStockItems,
+      totalMenuItems,
+      pendingOrders,
+      totalEmployees,
+    ] = await Promise.all([
+      prisma.order.count({
+        where: {
+          createdAt: {
+            gte: today,
+            lt: tomorrow,
+          },
         },
-      },
-    });
-
-    // Today's revenue
-    const todayRevenue = await prisma.order.aggregate({
-      where: {
-        createdAt: {
-          gte: today,
-          lt: tomorrow,
+      }),
+      prisma.order.aggregate({
+        where: {
+          createdAt: {
+            gte: today,
+            lt: tomorrow,
+          },
+          status: {
+            in: ['COMPLETED', 'SERVED'],
+          },
         },
-        status: {
-          in: ['COMPLETED', 'SERVED'],
+        _sum: {
+          totalAmount: true,
         },
-      },
-      _sum: {
-        totalAmount: true,
-      },
-    });
-
-    // Total customers
-    const totalCustomers = await prisma.customer.count();
-
-    // Active reservations today
-    const todayReservations = await prisma.reservation.count({
-      where: {
-        reservationTime: {
-          gte: today,
-          lt: tomorrow,
+      }),
+      prisma.customer.count(),
+      prisma.reservation.count({
+        where: {
+          reservationTime: {
+            gte: today,
+            lt: tomorrow,
+          },
+          status: 'CONFIRMED',
         },
-        status: 'CONFIRMED',
-      },
-    });
-
-    // Low stock items
-    const lowStockItems = await prisma.$queryRaw`
-      SELECT COUNT(*) as count
-      FROM "InventoryItem"
-      WHERE quantity <= "reorderLevel"
-    `;
-
-    // Total menu items
-    const totalMenuItems = await prisma.menuItem.count({
-      where: { isAvailable: true },
-    });
-
-    // Pending orders
-    const pendingOrders = await prisma.order.count({
-      where: {
-        status: 'PENDING',
-      },
-    });
-
-    // Total employees
-    const totalEmployees = await prisma.employee.count();
+      }),
+      prisma.$queryRaw`
+        SELECT COUNT(*) as count
+        FROM "InventoryItem"
+        WHERE quantity <= "reorderLevel"
+      `,
+      prisma.menuItem.count({
+        where: { isAvailable: true },
+      }),
+      prisma.order.count({
+        where: {
+          status: 'PENDING',
+        },
+      }),
+      prisma.employee.count(),
+    ]);
 
     res.status(200).json({
       success: true,
@@ -95,88 +103,15 @@ exports.getDashboardStats = async (req, res) => {
   }
 };
 
-// Get revenue report
+// Get revenue report — daily, monthly, or yearly breakdown from DB
 exports.getRevenueReport = async (req, res) => {
   try {
-    const { period = 'week' } = req.query;
-
-    const today = new Date();
-    let startDate = new Date();
-
-    // Calculate date range based on period
-    switch (period) {
-      case 'day':
-        startDate.setDate(today.getDate() - 1);
-        break;
-      case 'week':
-        startDate.setDate(today.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(today.getMonth() - 1);
-        break;
-      case 'year':
-        startDate.setFullYear(today.getFullYear() - 1);
-        break;
-      default:
-        startDate.setDate(today.getDate() - 7);
-    }
-
-    // Get orders in date range
-    const orders = await prisma.order.findMany({
-      where: {
-        createdAt: {
-          gte: startDate,
-        },
-        status: {
-          in: ['COMPLETED', 'SERVED'],
-        },
-      },
-      select: {
-        totalAmount: true,
-        createdAt: true,
-        type: true,
-      },
-    });
-
-    // Calculate total revenue
-    const totalRevenue = orders.reduce(
-      (sum, order) => sum + parseFloat(order.totalAmount),
-      0
-    );
-
-    // Group by date
-    const revenueByDate = {};
-    orders.forEach((order) => {
-      const date = order.createdAt.toISOString().split('T')[0];
-      if (!revenueByDate[date]) {
-        revenueByDate[date] = 0;
-      }
-      revenueByDate[date] += parseFloat(order.totalAmount);
-    });
-
-    // Group by order type
-    const revenueByType = {
-      DINE_IN: 0,
-      TAKEAWAY: 0,
-      ONLINE_DELIVERY: 0,
-    };
-    orders.forEach((order) => {
-      revenueByType[order.type] += parseFloat(order.totalAmount);
-    });
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getRevenueAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        totalRevenue,
-        totalOrders: orders.length,
-        averageOrderValue: orders.length > 0 ? totalRevenue / orders.length : 0,
-        revenueByDate: Object.entries(revenueByDate).map(([date, amount]) => ({
-          date,
-          amount,
-        })),
-        revenueByType,
-        period,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching revenue report:', error);
@@ -188,121 +123,38 @@ exports.getRevenueReport = async (req, res) => {
   }
 };
 
-// Get sales report
+exports.exportRevenueReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createRevenueReportPdf({ view, year, month, yearsBack });
+
+    const filename = `revenue-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting revenue report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export revenue report',
+        error: error.message,
+      });
+    }
+  }
+};
+
+// Get sales report — daily, monthly, or yearly breakdown from DB
 exports.getSalesReport = async (req, res) => {
   try {
-    const { period = 'week' } = req.query;
-
-    const today = new Date();
-    let startDate = new Date();
-
-    switch (period) {
-      case 'day':
-        startDate.setDate(today.getDate() - 1);
-        break;
-      case 'week':
-        startDate.setDate(today.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(today.getMonth() - 1);
-        break;
-      case 'year':
-        startDate.setFullYear(today.getFullYear() - 1);
-        break;
-      default:
-        startDate.setDate(today.getDate() - 7);
-    }
-
-    // Get top selling items
-    const topSellingItems = await prisma.orderItem.groupBy({
-      by: ['menuItemId'],
-      where: {
-        order: {
-          createdAt: {
-            gte: startDate,
-          },
-          status: {
-            in: ['COMPLETED', 'SERVED'],
-          },
-        },
-      },
-      _sum: {
-        quantity: true,
-      },
-      _count: {
-        orderItemId: true,
-      },
-      orderBy: {
-        _sum: {
-          quantity: 'desc',
-        },
-      },
-      take: 10,
-    });
-
-    // Get menu item details
-    const menuItemIds = topSellingItems.map((item) => item.menuItemId);
-    const menuItems = await prisma.menuItem.findMany({
-      where: {
-        itemId: {
-          in: menuItemIds,
-        },
-      },
-      select: {
-        itemId: true,
-        name: true,
-        price: true,
-        imageUrl: true,
-        category: {
-          select: {
-            name: true,
-          },
-        },
-      },
-    });
-
-    // Combine data
-    const topItems = topSellingItems.map((item) => {
-      const menuItem = menuItems.find((m) => m.itemId === item.menuItemId);
-      return {
-        menuItemId: item.menuItemId,
-        name: menuItem?.name || 'Unknown',
-        category: menuItem?.category?.name || 'Unknown',
-        price: parseFloat(menuItem?.price || 0),
-        totalQuantitySold: item._sum.quantity,
-        orderCount: item._count.orderItemId,
-        revenue: item._sum.quantity * parseFloat(menuItem?.price || 0),
-      };
-    });
-
-    // Get sales by category
-    const salesByCategory = await prisma.$queryRaw`
-      SELECT c."name" as category, 
-             COUNT(DISTINCT o."orderId") as order_count,
-             SUM(oi."quantity") as total_quantity,
-             SUM(oi."quantity" * oi."unitPrice") as revenue
-      FROM "OrderItem" oi
-      JOIN "MenuItem" mi ON oi."menuItemId" = mi."itemId"
-      JOIN "Category" c ON mi."categoryId" = c."categoryId"
-      JOIN "Order" o ON oi."orderId" = o."orderId"
-      WHERE o."createdAt" >= ${startDate}
-        AND o."status" IN ('COMPLETED', 'SERVED')
-      GROUP BY c."name"
-      ORDER BY revenue DESC
-    `;
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getSalesAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        topSellingItems: topItems,
-        salesByCategory: salesByCategory.map((cat) => ({
-          category: cat.category,
-          orderCount: parseInt(cat.order_count),
-          totalQuantity: parseInt(cat.total_quantity),
-          revenue: parseFloat(cat.revenue),
-        })),
-        period,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching sales report:', error);
@@ -314,142 +166,39 @@ exports.getSalesReport = async (req, res) => {
   }
 };
 
+exports.exportSalesReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createSalesReportPdf({ view, year, month, yearsBack });
+
+    const filename = `sales-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting sales report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export sales report',
+        error: error.message,
+      });
+    }
+  }
+};
+
 // Get customer insights
+// Get customer insights — daily, monthly, or yearly breakdown from DB
 exports.getCustomerInsights = async (req, res) => {
   try {
-    const { period = 'month' } = req.query;
-
-    const today = new Date();
-    let startDate = new Date();
-
-    switch (period) {
-      case 'week':
-        startDate.setDate(today.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(today.getMonth() - 1);
-        break;
-      case 'year':
-        startDate.setFullYear(today.getFullYear() - 1);
-        break;
-      default:
-        startDate.setMonth(today.getMonth() - 1);
-    }
-
-    // New customers in period
-    const newCustomers = await prisma.customer.count({
-      where: {
-        user: {
-          createdAt: {
-            gte: startDate,
-          },
-        },
-      },
-    });
-
-    // Top customers by order count
-    const topCustomers = await prisma.customer.findMany({
-      where: {
-        orders: {
-          some: {
-            createdAt: {
-              gte: startDate,
-            },
-          },
-        },
-      },
-      select: {
-        customerId: true,
-        fullName: true,
-        loyaltyPoints: true,
-        user: {
-          select: {
-            email: true,
-          },
-        },
-        _count: {
-          select: {
-            orders: {
-              where: {
-                createdAt: {
-                  gte: startDate,
-                },
-              },
-            },
-          },
-        },
-        orders: {
-          where: {
-            createdAt: {
-              gte: startDate,
-            },
-            status: {
-              in: ['COMPLETED', 'SERVED'],
-            },
-          },
-          select: {
-            totalAmount: true,
-          },
-        },
-      },
-      orderBy: {
-        orders: {
-          _count: 'desc',
-        },
-      },
-      take: 10,
-    });
-
-    const customerStats = topCustomers.map((customer) => ({
-      customerId: customer.customerId,
-      name: customer.fullName,
-      email: customer.user?.email,
-      loyaltyPoints: customer.loyaltyPoints,
-      orderCount: customer._count.orders,
-      totalSpent: customer.orders.reduce(
-        (sum, order) => sum + parseFloat(order.totalAmount),
-        0
-      ),
-    }));
-
-    // Customer retention (customers with multiple orders)
-    const repeatCustomers = await prisma.customer.count({
-      where: {
-        orders: {
-          some: {
-            createdAt: {
-              gte: startDate,
-            },
-          },
-        },
-      },
-    });
-
-    const totalActiveCustomers = await prisma.customer.count({
-      where: {
-        orders: {
-          some: {
-            createdAt: {
-              gte: startDate,
-            },
-          },
-        },
-      },
-    });
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getCustomerAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        newCustomers,
-        totalActiveCustomers,
-        repeatCustomers,
-        retentionRate:
-          totalActiveCustomers > 0
-            ? ((repeatCustomers / totalActiveCustomers) * 100).toFixed(2)
-            : 0,
-        topCustomers: customerStats,
-        period,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching customer insights:', error);
@@ -461,68 +210,38 @@ exports.getCustomerInsights = async (req, res) => {
   }
 };
 
-// Get inventory report
+exports.exportCustomerReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createCustomerReportPdf({ view, year, month, yearsBack });
+
+    const filename = `customer-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting customer report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export customer report',
+        error: error.message,
+      });
+    }
+  }
+};
+
+// Get inventory report — daily, monthly, or yearly movement breakdown from DB
 exports.getInventoryReport = async (req, res) => {
   try {
-    // Low stock items
-    const lowStockItems = await prisma.$queryRaw`
-      SELECT "inventoryId", "itemName", "quantity", "unit", "reorderLevel", "costPerUnit"
-      FROM "InventoryItem"
-      WHERE quantity <= "reorderLevel"
-      ORDER BY (quantity / "reorderLevel") ASC
-    `;
-
-    // Total inventory value
-    const inventoryValue = await prisma.$queryRaw`
-      SELECT SUM(quantity * "costPerUnit") as total_value
-      FROM "InventoryItem"
-    `;
-
-    // Inventory summary
-    const totalItems = await prisma.inventoryItem.count();
-    const lowStockCount = lowStockItems.length;
-
-    // Get all inventory with stock status
-    const allInventory = await prisma.inventoryItem.findMany({
-      orderBy: {
-        lastUpdated: 'desc',
-      },
-    });
-
-    const inventoryWithStatus = allInventory.map((item) => ({
-      ...item,
-      quantity: parseFloat(item.quantity),
-      reorderLevel: parseFloat(item.reorderLevel),
-      costPerUnit: parseFloat(item.costPerUnit),
-      totalValue: parseFloat(item.quantity) * parseFloat(item.costPerUnit),
-      status:
-        parseFloat(item.quantity) <= parseFloat(item.reorderLevel)
-          ? 'Low Stock'
-          : parseFloat(item.quantity) <= parseFloat(item.reorderLevel) * 1.5
-          ? 'Medium Stock'
-          : 'In Stock',
-    }));
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getInventoryAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        totalItems,
-        lowStockCount,
-        totalInventoryValue: parseFloat(inventoryValue[0]?.total_value || 0),
-        lowStockItems: lowStockItems.map((item) => ({
-          inventoryId: item.inventoryId,
-          itemName: item.itemName,
-          quantity: parseFloat(item.quantity),
-          unit: item.unit,
-          reorderLevel: parseFloat(item.reorderLevel),
-          costPerUnit: parseFloat(item.costPerUnit),
-          stockPercentage: (
-            (parseFloat(item.quantity) / parseFloat(item.reorderLevel)) *
-            100
-          ).toFixed(2),
-        })),
-        inventoryItems: inventoryWithStatus,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching inventory report:', error);
@@ -534,99 +253,38 @@ exports.getInventoryReport = async (req, res) => {
   }
 };
 
-// Get employee performance
+exports.exportInventoryReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createInventoryReportPdf({ view, year, month, yearsBack });
+
+    const filename = `inventory-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting inventory report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export inventory report',
+        error: error.message,
+      });
+    }
+  }
+};
+
+// Get employee performance — daily, monthly, or yearly breakdown from DB
 exports.getEmployeePerformance = async (req, res) => {
   try {
-    const { period = 'month' } = req.query;
-
-    const today = new Date();
-    let startDate = new Date();
-
-    switch (period) {
-      case 'week':
-        startDate.setDate(today.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(today.getMonth() - 1);
-        break;
-      case 'year':
-        startDate.setFullYear(today.getFullYear() - 1);
-        break;
-      default:
-        startDate.setMonth(today.getMonth() - 1);
-    }
-
-    // Get employees with order counts
-    const employees = await prisma.employee.findMany({
-      select: {
-        employeeId: true,
-        fullName: true,
-        designation: true,
-        user: {
-          select: {
-            role: true,
-          },
-        },
-        _count: {
-          select: {
-            ordersProcessed: {
-              where: {
-                createdAt: {
-                  gte: startDate,
-                },
-              },
-            },
-          },
-        },
-        ordersProcessed: {
-          where: {
-            createdAt: {
-              gte: startDate,
-            },
-            status: {
-              in: ['COMPLETED', 'SERVED'],
-            },
-          },
-          select: {
-            totalAmount: true,
-          },
-        },
-      },
-      orderBy: {
-        ordersProcessed: {
-          _count: 'desc',
-        },
-      },
-    });
-
-    const employeeStats = employees.map((employee) => ({
-      employeeId: employee.employeeId,
-      name: employee.fullName,
-      designation: employee.designation,
-      role: employee.user?.role,
-      ordersProcessed: employee._count.ordersProcessed,
-      totalRevenue: employee.ordersProcessed.reduce(
-        (sum, order) => sum + parseFloat(order.totalAmount),
-        0
-      ),
-    }));
-
-    // Total employees
-    const totalEmployees = await prisma.employee.count();
-
-    // Active employees (processed orders in period)
-    const activeEmployees = employeeStats.filter(
-      (emp) => emp.ordersProcessed > 0
-    ).length;
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getEmployeeAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        totalEmployees,
-        activeEmployees,
-        employeePerformance: employeeStats,
-        period,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching employee performance:', error);
@@ -638,96 +296,38 @@ exports.getEmployeePerformance = async (req, res) => {
   }
 };
 
-// Get order trends
+exports.exportEmployeeReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createEmployeeReportPdf({ view, year, month, yearsBack });
+
+    const filename = `employee-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting employee report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export employee report',
+        error: error.message,
+      });
+    }
+  }
+};
+
+// Get order trends — daily, monthly, or yearly breakdown from DB
 exports.getOrderTrends = async (req, res) => {
   try {
-    const { period = 'week' } = req.query;
-
-    const today = new Date();
-    let startDate = new Date();
-
-    switch (period) {
-      case 'day':
-        startDate.setDate(today.getDate() - 1);
-        break;
-      case 'week':
-        startDate.setDate(today.getDate() - 7);
-        break;
-      case 'month':
-        startDate.setMonth(today.getMonth() - 1);
-        break;
-      case 'year':
-        startDate.setFullYear(today.getFullYear() - 1);
-        break;
-      default:
-        startDate.setDate(today.getDate() - 7);
-    }
-
-    // Orders by status
-    const ordersByStatus = await prisma.order.groupBy({
-      by: ['status'],
-      where: {
-        createdAt: {
-          gte: startDate,
-        },
-      },
-      _count: {
-        orderId: true,
-      },
-    });
-
-    // Orders by type
-    const ordersByType = await prisma.order.groupBy({
-      by: ['type'],
-      where: {
-        createdAt: {
-          gte: startDate,
-        },
-      },
-      _count: {
-        orderId: true,
-      },
-    });
-
-    // Orders by date
-    const ordersByDate = await prisma.$queryRaw`
-      SELECT DATE("createdAt") as date, COUNT(*) as count
-      FROM "Order"
-      WHERE "createdAt" >= ${startDate}
-      GROUP BY DATE("createdAt")
-      ORDER BY date ASC
-    `;
-
-    // Peak hours
-    const ordersByHour = await prisma.$queryRaw`
-      SELECT EXTRACT(HOUR FROM "createdAt") as hour, COUNT(*) as count
-      FROM "Order"
-      WHERE "createdAt" >= ${startDate}
-      GROUP BY EXTRACT(HOUR FROM "createdAt")
-      ORDER BY hour ASC
-    `;
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const data = await getOrderTrendsAnalytics({ view, year, month, yearsBack });
 
     res.status(200).json({
       success: true,
-      data: {
-        ordersByStatus: ordersByStatus.map((item) => ({
-          status: item.status,
-          count: item._count.orderId,
-        })),
-        ordersByType: ordersByType.map((item) => ({
-          type: item.type,
-          count: item._count.orderId,
-        })),
-        ordersByDate: ordersByDate.map((item) => ({
-          date: item.date.toISOString().split('T')[0],
-          count: parseInt(item.count),
-        })),
-        peakHours: ordersByHour.map((item) => ({
-          hour: parseInt(item.hour),
-          count: parseInt(item.count),
-        })),
-        period,
-      },
+      data,
     });
   } catch (error) {
     console.error('Error fetching order trends:', error);
@@ -739,21 +339,53 @@ exports.getOrderTrends = async (req, res) => {
   }
 };
 
+exports.exportOrderTrendsReportPdf = async (req, res) => {
+  try {
+    const { view = 'daily', year, month, yearsBack } = req.query;
+    const { doc } = await createOrderTrendsReportPdf({ view, year, month, yearsBack });
+
+    const filename = `order-trends-report-${view}-${Date.now()}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    doc.pipe(res);
+    doc.end();
+  } catch (error) {
+    console.error('Error exporting order trends report PDF:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        message: 'Failed to export order trends report',
+        error: error.message,
+      });
+    }
+  }
+};
+
 // Get comprehensive dashboard overview
 exports.getDashboardOverview = async (req, res) => {
   try {
     // Calculate date ranges
-    const today = new Date();
+    const now = new Date();
+
+    // First moment of today
+    const today = new Date(now);
     today.setHours(0, 0, 0, 0);
-    
+
     const lastWeek = new Date(today);
     lastWeek.setDate(lastWeek.getDate() - 7);
-    
-    const lastMonth = new Date(today);
-    lastMonth.setMonth(lastMonth.getMonth() - 1);
 
-    const previousMonthStart = new Date(lastMonth);
-    previousMonthStart.setMonth(previousMonthStart.getMonth() - 1);
+    // First day of the current calendar month
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    // First day of the previous calendar month
+    const previousMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
+    // First day of the month before the previous one (used as lower bound for prev-month query)
+    const twoMonthsAgoStart = new Date(now.getFullYear(), now.getMonth() - 2, 1);
+
+    // Start of the rolling 12-month window (first day of the month 11 months ago)
+    const twelveMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 11, 1);
 
     // ✅ OPTIMIZATION: Run all stat queries in parallel (10x faster!)
     const [
@@ -766,32 +398,33 @@ exports.getDashboardOverview = async (req, res) => {
       totalMenuItems,
       weeklyOrders,
       categorySales,
-      recentOrders
+      recentOrders,
+      monthlyRevenueRaw,
     ] = await Promise.all([
-      // Stats queries
+      // Stats queries — all scoped to current vs previous calendar month
       prisma.order.aggregate({
         where: {
-          createdAt: { gte: lastMonth },
+          createdAt: { gte: currentMonthStart },
           status: { in: ['COMPLETED', 'SERVED'] },
         },
         _sum: { totalAmount: true },
       }),
       prisma.order.aggregate({
         where: {
-          createdAt: { gte: previousMonthStart, lt: lastMonth },
+          createdAt: { gte: previousMonthStart, lt: currentMonthStart },
           status: { in: ['COMPLETED', 'SERVED'] },
         },
         _sum: { totalAmount: true },
       }),
       prisma.order.count({
-        where: { createdAt: { gte: lastMonth } },
+        where: { createdAt: { gte: currentMonthStart } },
       }),
       prisma.order.count({
-        where: { createdAt: { gte: previousMonthStart, lt: lastMonth } },
+        where: { createdAt: { gte: previousMonthStart, lt: currentMonthStart } },
       }),
       prisma.customer.count(),
       prisma.customer.count({
-        where: { user: { createdAt: { lt: lastMonth } } },
+        where: { user: { createdAt: { lt: currentMonthStart } } },
       }),
       prisma.menuItem.count({
         where: { isAvailable: true },
@@ -807,6 +440,12 @@ exports.getDashboardOverview = async (req, res) => {
       // Category sales
       prisma.orderItem.groupBy({
         by: ['menuItemId'],
+        where: {
+          order: {
+            createdAt: { gte: currentMonthStart },
+            status: { in: ['COMPLETED', 'SERVED'] },
+          },
+        },
         _sum: { quantity: true },
         _count: { orderItemId: true },
       }),
@@ -820,7 +459,20 @@ exports.getDashboardOverview = async (req, res) => {
           },
           items: true,
         },
-      })
+      }),
+      // Monthly revenue – last 12 months grouped by calendar month
+      prisma.$queryRaw`
+        SELECT
+          TO_CHAR(DATE_TRUNC('month', "createdAt"), 'Mon YYYY') AS month,
+          DATE_TRUNC('month', "createdAt")                       AS month_date,
+          COALESCE(SUM("totalAmount"), 0)                        AS revenue,
+          COUNT(*)                                               AS orders
+        FROM "Order"
+        WHERE "createdAt" >= ${twelveMonthsAgo}
+          AND "status" IN ('COMPLETED', 'SERVED')
+        GROUP BY DATE_TRUNC('month', "createdAt")
+        ORDER BY month_date ASC
+      `,
     ]);
 
     // Calculate percentage changes
@@ -915,6 +567,13 @@ exports.getDashboardOverview = async (req, res) => {
       };
     });
 
+    // Format monthly revenue for the chart
+    const monthlyRevenueData = monthlyRevenueRaw.map((row) => ({
+      month: row.month,
+      revenue: parseFloat(row.revenue),
+      orders: parseInt(row.orders, 10),
+    }));
+
     res.status(200).json({
       success: true,
       data: {
@@ -941,6 +600,7 @@ exports.getDashboardOverview = async (req, res) => {
           },
         },
         weeklyRevenue: weeklyData,
+        monthlyRevenue: monthlyRevenueData,
         categoryDistribution: categoryData,
         recentOrders: formattedOrders,
       },
@@ -958,22 +618,24 @@ exports.getDashboardOverview = async (req, res) => {
 exports.getSalesForecast = async (req, res) => {
   try {
     const requestedDays = parseInt(req.query.days, 10);
+    const historyDays = parseInt(req.query.historyDays, 10);
     const days = Number.isInteger(requestedDays) ? Math.min(Math.max(requestedDays, 1), 180) : 30;
+    const lookbackDays = Number.isInteger(historyDays)
+      ? Math.min(Math.max(historyDays, 0), 30)
+      : 7;
     const modelVersion =
       req.query.modelVersion || process.env.FORECAST_MODEL_VERSION || 'prophet-v1';
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const endDate = new Date(today);
-    endDate.setDate(endDate.getDate() + days - 1);
+    const today = toLocalDate();
+    const rangeStart = addDays(today, -lookbackDays);
+    const rangeEnd = addDays(today, days - 1);
 
     const forecasts = await prisma.salesForecast.findMany({
       where: {
         modelVersion,
         forecastDate: {
-          gte: today,
-          lte: endDate,
+          gte: rangeStart,
+          lte: rangeEnd,
         },
       },
       orderBy: {
@@ -985,40 +647,59 @@ exports.getSalesForecast = async (req, res) => {
       SELECT DATE("createdAt") as date, SUM("totalAmount") as amount
       FROM "Order"
       WHERE "status" IN ('COMPLETED', 'SERVED')
-        AND DATE("createdAt") >= ${today}
-        AND DATE("createdAt") <= ${endDate}
+        AND DATE("createdAt") >= ${rangeStart}
+        AND DATE("createdAt") <= ${rangeEnd}
       GROUP BY DATE("createdAt")
       ORDER BY date ASC
     `;
 
     const actualMap = new Map(
-      actuals.map(row => [
-        row.date.toISOString().split('T')[0],
-        parseFloat(row.amount || 0),
-      ])
+      actuals.map((row) => [formatDateKey(row.date), parseFloat(row.amount || 0)])
     );
 
-    const data = forecasts.map(item => {
-      const date = item.forecastDate.toISOString().split('T')[0];
+    const forecastMap = new Map(
+      forecasts.map((item) => [formatDateKey(item.forecastDate), item])
+    );
+
+    const dateKeys = [];
+    for (let cursor = new Date(rangeStart); cursor <= rangeEnd; cursor = addDays(cursor, 1)) {
+      dateKeys.push(formatDateKey(cursor));
+    }
+
+    const data = dateKeys.map((date) => {
+      const forecast = forecastMap.get(date);
 
       return {
         date,
-        predictedRevenue: parseFloat(item.predictedRevenue),
-        lowerBoundRevenue: parseFloat(item.lowerBoundRevenue),
-        upperBoundRevenue: parseFloat(item.upperBoundRevenue),
+        predictedRevenue: forecast ? parseFloat(forecast.predictedRevenue) : null,
+        lowerBoundRevenue: forecast ? parseFloat(forecast.lowerBoundRevenue) : null,
+        upperBoundRevenue: forecast ? parseFloat(forecast.upperBoundRevenue) : null,
         actualRevenue: actualMap.has(date) ? actualMap.get(date) : null,
-        modelVersion: item.modelVersion,
-        generatedAt: item.generatedAt,
+        modelVersion: forecast?.modelVersion || modelVersion,
+        generatedAt: forecast?.generatedAt || null,
+        isFuture: date >= formatDateKey(today),
       };
     });
+
+    const futureForecasts = data.filter(
+      (row) => row.isFuture && row.predictedRevenue !== null
+    );
+    const latestGeneratedAt = forecasts.reduce((latest, item) => {
+      if (!latest || item.generatedAt > latest) return item.generatedAt;
+      return latest;
+    }, null);
 
     res.status(200).json({
       success: true,
       data: {
         modelVersion,
         days,
-        count: data.length,
-        hasForecast: data.length > 0,
+        lookbackDays,
+        count: futureForecasts.length,
+        hasForecast: futureForecasts.length > 0,
+        generatedAt: latestGeneratedAt,
+        rangeStart: formatDateKey(rangeStart),
+        rangeEnd: formatDateKey(rangeEnd),
         forecast: data,
       },
     });

@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -28,14 +28,41 @@ def get_daily_sales(connection) -> pd.DataFrame:
     return pd.read_sql(query, connection)
 
 
+def fill_missing_days(sales: pd.DataFrame) -> pd.DataFrame:
+    """Expand to a continuous daily series with 0 revenue on days without orders."""
+    if sales.empty:
+        return sales
+
+    frame = sales.copy()
+    frame["ds"] = pd.to_datetime(frame["ds"])
+    frame["y"] = frame["y"].astype(float)
+
+    start_date = frame["ds"].min()
+    end_date = pd.Timestamp.now().normalize()
+
+    full_range = pd.date_range(start=start_date, end=end_date, freq="D")
+    filled = pd.DataFrame({"ds": full_range})
+    filled = filled.merge(frame[["ds", "y"]], on="ds", how="left")
+    filled["y"] = filled["y"].fillna(0.0)
+    return filled
+
+
 def generate_forecast(data: pd.DataFrame, periods: int) -> pd.DataFrame:
-    model = Prophet(weekly_seasonality=True, yearly_seasonality=True, daily_seasonality=False)
+    last_hist = data["ds"].max()
+    yearly = len(data) >= 365
+
+    model = Prophet(
+        weekly_seasonality=True,
+        yearly_seasonality=yearly,
+        daily_seasonality=False,
+    )
     model.fit(data)
 
     future = model.make_future_dataframe(periods=periods)
     forecast = model.predict(future)
 
-    result = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(periods).copy()
+    result = forecast[forecast["ds"] > last_hist][["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
+    result = result.head(periods)
     result["yhat"] = result["yhat"].clip(lower=0)
     result["yhat_lower"] = result["yhat_lower"].clip(lower=0)
     result["yhat_upper"] = result["yhat_upper"].clip(lower=0)
@@ -43,7 +70,7 @@ def generate_forecast(data: pd.DataFrame, periods: int) -> pd.DataFrame:
 
 
 def upsert_forecast(connection, forecast: pd.DataFrame, model_version: str) -> int:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     rows = []
 
     for _, row in forecast.iterrows():
@@ -62,18 +89,16 @@ def upsert_forecast(connection, forecast: pd.DataFrame, model_version: str) -> i
         return 0
 
     with connection.cursor() as cursor:
+        cursor.execute(
+            'DELETE FROM "SalesForecast" WHERE "modelVersion" = %s',
+            (model_version,),
+        )
         execute_values(
             cursor,
             '''
             INSERT INTO "SalesForecast"
                 ("forecastDate", "predictedRevenue", "lowerBoundRevenue", "upperBoundRevenue", "modelVersion", "generatedAt")
             VALUES %s
-            ON CONFLICT ("forecastDate", "modelVersion")
-            DO UPDATE SET
-                "predictedRevenue" = EXCLUDED."predictedRevenue",
-                "lowerBoundRevenue" = EXCLUDED."lowerBoundRevenue",
-                "upperBoundRevenue" = EXCLUDED."upperBoundRevenue",
-                "generatedAt" = EXCLUDED."generatedAt"
             ''',
             rows,
         )
@@ -107,16 +132,26 @@ def main():
 
     try:
         sales = get_daily_sales(connection)
-        if sales.empty or len(sales) < 14:
+        if sales.empty:
+            raise RuntimeError("No historical sales data found")
+
+        sales = fill_missing_days(sales)
+        if len(sales) < 14:
             raise RuntimeError("Not enough historical sales data (need at least 14 days)")
 
-        sales["ds"] = pd.to_datetime(sales["ds"])
-        sales["y"] = sales["y"].astype(float)
-
         forecast = generate_forecast(sales, forecast_days)
-        count = upsert_forecast(connection, forecast, model_version)
+        if forecast.empty:
+            raise RuntimeError("Prophet did not produce any forecast rows")
 
-        print(f"Forecast generated successfully. Upserted rows: {count}")
+        count = upsert_forecast(connection, forecast, model_version)
+        last_hist = sales["ds"].max().date()
+        first_fc = forecast["ds"].min().date()
+        last_fc = forecast["ds"].max().date()
+
+        print(
+            f"Forecast generated successfully. "
+            f"History through {last_hist}, forecast {first_fc} to {last_fc}, upserted rows: {count}"
+        )
     finally:
         connection.close()
 

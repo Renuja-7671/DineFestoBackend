@@ -26,6 +26,7 @@ model User {
   email         String    @unique
   passwordHash  String
   role          Role      @default(CUSTOMER)
+  isActive      Boolean   @default(true)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   
@@ -111,6 +112,7 @@ model InventoryItem {
 
   // Relations
   usedInRecipes RecipeIngredient[]
+  ledgerEntries InventoryLedger[]
 }
 
 // Many-to-Many Link: Defines how much inventory is needed for one Menu Item
@@ -121,6 +123,31 @@ model RecipeIngredient {
   inventory    InventoryItem @relation(fields: [inventoryId], references: [inventoryId])
   inventoryId  Int
   quantityUsed Decimal       @db.Decimal(10, 3) // Amount deducted per order
+
+  @@unique([menuItemId, inventoryId])
+}
+
+enum InventoryMovementType {
+  ORDER_CONSUMPTION
+  MANUAL_ADJUSTMENT
+  STOCK_IN
+  WASTE
+  CANCELLATION_RETURN
+}
+
+model InventoryLedger {
+  ledgerId         Int                   @id @default(autoincrement())
+  inventory        InventoryItem         @relation(fields: [inventoryId], references: [inventoryId])
+  inventoryId      Int
+  movementType     InventoryMovementType
+  quantityChange   Decimal               @db.Decimal(10, 3)
+  referenceOrder   Order?                @relation(fields: [referenceOrderId], references: [orderId])
+  referenceOrderId Int?
+  note             String?
+  createdAt        DateTime              @default(now())
+
+  @@index([inventoryId, createdAt])
+  @@index([referenceOrderId])
 }
 
 // --------------------------------------
@@ -139,7 +166,6 @@ enum OrderStatus {
 enum OrderType {
   DINE_IN
   TAKEAWAY
-  ONLINE_DELIVERY
 }
 
 model Order {
@@ -158,10 +184,17 @@ model Order {
   tableNumber   Int?
   totalAmount   Decimal     @db.Decimal(10, 2)
   createdAt     DateTime    @default(now())
+  inventoryDeductedAt DateTime?
 
   // Relations
   items         OrderItem[]
   payment       Payment?
+  inventoryLedgerEntries InventoryLedger[]
+
+  @@index([createdAt])
+  @@index([status, createdAt])
+  @@index([customerId])
+  @@index([staffId, createdAt])
 }
 
 model OrderItem {
@@ -173,6 +206,9 @@ model OrderItem {
   quantity      Int
   unitPrice     Decimal  @db.Decimal(10, 2) // Snapshot of price at time of order
   customization String?  // e.g., "No onions", "Extra spicy"
+
+  @@index([orderId])
+  @@index([menuItemId])
 }
 
 // --------------------------------------
@@ -214,13 +250,25 @@ enum AttendanceStatus {
 }
 
 model Attendance {
-  attendanceId Int              @id @default(autoincrement())
-  employee     Employee         @relation(fields: [employeeId], references: [employeeId])
-  employeeId   Int
-  date         DateTime         @default(now()) @db.Date
-  checkInTime  DateTime?
-  checkOutTime DateTime?
-  status       AttendanceStatus
+  attendanceId           Int              @id @default(autoincrement())
+  employee               Employee         @relation(fields: [employeeId], references: [employeeId])
+  employeeId             Int
+  date                   DateTime         @default(now()) @db.Date
+  checkInTime            DateTime?
+  checkOutTime           DateTime?
+  status                 AttendanceStatus
+  checkInLatitude        Float?
+  checkInLongitude       Float?
+  checkInAccuracyMeters  Float?
+  checkInAtWorkplace     Boolean?
+  checkInDistanceMeters  Float?
+  checkOutLatitude       Float?
+  checkOutLongitude      Float?
+  checkOutAccuracyMeters Float?
+  checkOutAtWorkplace    Boolean?
+  checkOutDistanceMeters Float?
+
+  @@index([employeeId, date])
 }
 
 enum LeaveStatus {
@@ -229,16 +277,27 @@ enum LeaveStatus {
   REJECTED
 }
 
+enum LeaveType {
+  ANNUAL
+  CASUAL
+  MEDICAL
+}
+
 model LeaveRequest {
   leaveId      Int         @id @default(autoincrement())
   employee     Employee    @relation(fields: [employeeId], references: [employeeId])
   employeeId   Int
+  leaveType    LeaveType   @default(ANNUAL)
   startDate    DateTime
   endDate      DateTime
+  totalDays    Int         @default(1)
   reason       String
   status       LeaveStatus @default(PENDING)
   adminComment String?
   appliedAt    DateTime    @default(now())
+
+  @@index([employeeId, leaveType, status])
+  @@index([startDate])
 }
 
 // --------------------------------------
@@ -247,10 +306,13 @@ model LeaveRequest {
 
 model Reservation {
   reservationId   Int      @id @default(autoincrement())
-  customer        Customer @relation(fields: [customerId], references: [customerId])
-  customerId      Int
+  customer        Customer? @relation(fields: [customerId], references: [customerId])
+  customerId      Int?
+  guestName       String?
+  guestPhone      String?
   tableNumber     Int
   reservationTime DateTime
+  durationMinutes Int      @default(120)
   guestCount      Int
   status          String   @default("CONFIRMED") // CONFIRMED, CANCELLED, PENDING, SEATED, COMPLETED, NO_SHOW
   reservationAmount Decimal @default(0) @db.Decimal(10, 2)
@@ -258,6 +320,8 @@ model Reservation {
   remainingAmount   Decimal @default(0) @db.Decimal(10, 2)
   paymentStatus     String  @default("PENDING") // PENDING, PARTIAL, PAID
   paymentTransactionId String?
+
+  @@index([reservationTime, status])
 }
 
 model Review {
@@ -269,12 +333,15 @@ model Review {
   rating      Int      // 1-5 Stars
   comment     String?
   createdAt   DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 model Notification {
   notificationId Int      @id @default(autoincrement())
   user           User     @relation(fields: [userId], references: [userId])
   userId         Int
+  type           String?  // e.g. LOW_STOCK, STOCK_RESTORED, ORDER_STATUS, GENERAL
   message        String
   isRead         Boolean  @default(false)
   createdAt      DateTime @default(now())

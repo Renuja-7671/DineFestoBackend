@@ -1,5 +1,7 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../config/database');
+const inventoryConsumptionService = require('../services/inventoryConsumption.service');
+
+const VALID_ORDER_TYPES = ['DINE_IN', 'TAKEAWAY'];
 
 // Get all orders with filters
 exports.getAllOrders = async (req, res) => {
@@ -181,6 +183,13 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: 'Order type and items are required',
+      });
+    }
+
+    if (!VALID_ORDER_TYPES.includes(type)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid order type. Only DINE_IN and TAKEAWAY are supported.',
       });
     }
 
@@ -395,26 +404,56 @@ exports.updateOrderStatus = async (req, res) => {
     }
     // ADMIN, MANAGER, and CHEF can update any order (no restriction)
 
-    const order = await prisma.order.update({
-      where: { orderId: parseInt(id) },
-      data: { status },
-      include: {
-        customer: {
-          include: {
-            user: true,
+    const parsedOrderId = parseInt(id, 10);
+    const previousStatus = existingOrder.status;
+
+    const order = await prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { orderId: parsedOrderId },
+        data: { status },
+        include: {
+          customer: {
+            include: {
+              user: true,
+            },
+          },
+          items: {
+            include: {
+              menuItem: true,
+            },
+          },
+          staff: {
+            include: {
+              user: true,
+            },
           },
         },
-        items: {
-          include: {
-            menuItem: true,
-          },
-        },
-        staff: {
-          include: {
-            user: true,
-          },
-        },
-      },
+      });
+
+      const movedIntoDeductionStatus =
+        !inventoryConsumptionService.DEDUCTION_TRIGGER_STATUSES.includes(previousStatus) &&
+        inventoryConsumptionService.DEDUCTION_TRIGGER_STATUSES.includes(status);
+
+      if (movedIntoDeductionStatus) {
+        await inventoryConsumptionService.deductInventoryForOrder({
+          orderId: parsedOrderId,
+          note: `Auto deduction triggered on status ${status}`,
+          tx,
+        });
+      }
+
+      if (status === 'CANCELLED' && previousStatus !== 'CANCELLED') {
+        await inventoryConsumptionService.restoreInventoryForCancelledOrder({
+          orderId: parsedOrderId,
+          note: 'Inventory restored after order cancellation',
+          tx,
+        });
+      }
+
+      return updatedOrder;
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     res.json({
@@ -437,6 +476,7 @@ exports.attendOrder = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
+    const parsedOrderId = parseInt(id, 10);
 
     // Get employee record for the current user
     const employee = await prisma.employee.findUnique({
@@ -455,7 +495,7 @@ exports.attendOrder = async (req, res) => {
 
     // Check if order exists
     const existingOrder = await prisma.order.findUnique({
-      where: { orderId: parseInt(id) },
+      where: { orderId: parsedOrderId },
     });
 
     if (!existingOrder) {
@@ -481,30 +521,43 @@ exports.attendOrder = async (req, res) => {
       });
     }
 
-    // Update order to PREPARING status and assign staff
-    const order = await prisma.order.update({
-      where: { orderId: parseInt(id) },
-      data: { 
-        status: 'PREPARING',
-        staffId: employee.employeeId,
-      },
-      include: {
-        customer: {
-          include: {
-            user: true,
+    // Update order to PREPARING status, assign staff, and deduct inventory
+    const order = await prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { orderId: parsedOrderId },
+        data: {
+          status: 'PREPARING',
+          staffId: employee.employeeId,
+        },
+        include: {
+          customer: {
+            include: {
+              user: true,
+            },
+          },
+          items: {
+            include: {
+              menuItem: true,
+            },
+          },
+          staff: {
+            include: {
+              user: true,
+            },
           },
         },
-        items: {
-          include: {
-            menuItem: true,
-          },
-        },
-        staff: {
-          include: {
-            user: true,
-          },
-        },
-      },
+      });
+
+      await inventoryConsumptionService.deductInventoryForOrder({
+        orderId: parsedOrderId,
+        note: 'Auto deduction triggered on attend (PREPARING)',
+        tx,
+      });
+
+      return updatedOrder;
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     res.json({
@@ -527,10 +580,11 @@ exports.updateOrder = async (req, res) => {
   try {
     const { id } = req.params;
     const { type, tableNumber, status } = req.body;
+    const parsedOrderId = parseInt(id, 10);
 
     // Check if order exists
     const existingOrder = await prisma.order.findUnique({
-      where: { orderId: parseInt(id) },
+      where: { orderId: parsedOrderId },
     });
 
     if (!existingOrder) {
@@ -541,25 +595,71 @@ exports.updateOrder = async (req, res) => {
     }
 
     const updateData = {};
-    if (type !== undefined) updateData.type = type;
+    if (type !== undefined) {
+      if (!VALID_ORDER_TYPES.includes(type)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid order type. Only DINE_IN and TAKEAWAY are supported.',
+        });
+      }
+      updateData.type = type;
+    }
     if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
-    if (status !== undefined) updateData.status = status;
+    if (status !== undefined) {
+      const validStatuses = ['PENDING', 'PREPARING', 'READY', 'SERVED', 'COMPLETED', 'CANCELLED'];
+      if (!validStatuses.includes(status)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid status',
+        });
+      }
+      updateData.status = status;
+    }
 
-    const order = await prisma.order.update({
-      where: { orderId: parseInt(id) },
-      data: updateData,
-      include: {
-        customer: {
-          include: {
-            user: true,
+    const order = await prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { orderId: parsedOrderId },
+        data: updateData,
+        include: {
+          customer: {
+            include: {
+              user: true,
+            },
+          },
+          items: {
+            include: {
+              menuItem: true,
+            },
           },
         },
-        items: {
-          include: {
-            menuItem: true,
-          },
-        },
-      },
+      });
+
+      if (status !== undefined) {
+        const movedIntoDeductionStatus =
+          !inventoryConsumptionService.DEDUCTION_TRIGGER_STATUSES.includes(existingOrder.status) &&
+          inventoryConsumptionService.DEDUCTION_TRIGGER_STATUSES.includes(status);
+
+        if (movedIntoDeductionStatus) {
+          await inventoryConsumptionService.deductInventoryForOrder({
+            orderId: parsedOrderId,
+            note: `Auto deduction triggered on status ${status} via order update`,
+            tx,
+          });
+        }
+
+        if (status === 'CANCELLED' && existingOrder.status !== 'CANCELLED') {
+          await inventoryConsumptionService.restoreInventoryForCancelledOrder({
+            orderId: parsedOrderId,
+            note: 'Inventory restored after order cancellation via order update',
+            tx,
+          });
+        }
+      }
+
+      return updatedOrder;
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     res.json({
@@ -649,21 +749,34 @@ exports.cancelOrder = async (req, res) => {
     }
 
     // Update order status to CANCELLED
-    const cancelledOrder = await prisma.order.update({
-      where: { orderId: parseInt(id) },
-      data: { status: 'CANCELLED' },
-      include: {
-        customer: {
-          include: {
-            user: true,
+    const cancelledOrder = await prisma.$transaction(async (tx) => {
+      const updatedOrder = await tx.order.update({
+        where: { orderId: parseInt(id, 10) },
+        data: { status: 'CANCELLED' },
+        include: {
+          customer: {
+            include: {
+              user: true,
+            },
+          },
+          items: {
+            include: {
+              menuItem: true,
+            },
           },
         },
-        items: {
-          include: {
-            menuItem: true,
-          },
-        },
-      },
+      });
+
+      await inventoryConsumptionService.restoreInventoryForCancelledOrder({
+        orderId: parseInt(id, 10),
+        note: 'Inventory restored after customer cancellation',
+        tx,
+      });
+
+      return updatedOrder;
+    }, {
+      maxWait: 10000,
+      timeout: 30000,
     });
 
     // Map orderId to id for frontend consistency

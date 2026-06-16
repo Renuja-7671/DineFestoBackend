@@ -7,6 +7,9 @@ const router = express.Router();
 // All inventory routes require authentication and admin/manager role
 router.get('/', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.getAllInventoryItems);
 router.get('/stats', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.getInventoryStats);
+router.get('/ledger', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.getInventoryLedger);
+router.get('/recipes/:menuItemId', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.getRecipeByMenuItem);
+router.put('/recipes/:menuItemId', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.upsertMenuItemRecipe);
 router.get('/:id', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.getInventoryItemById);
 router.post('/', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.createInventoryItem);
 router.put('/:id', authenticate, authorize('ADMIN', 'MANAGER'), inventoryController.updateInventoryItem);

@@ -1,0 +1,8 @@
+.venv-forecast
+forecasting
+scripts
+node_modules/.cache
+*.log
+.env
+.env.*
+!.env.example

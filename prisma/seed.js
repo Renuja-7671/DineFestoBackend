@@ -313,9 +313,8 @@ async function main() {
     // Determine order type
     const typeRand = Math.random();
     let orderType;
-    if (typeRand < 0.6) orderType = 'DINE_IN';
-    else if (typeRand < 0.85) orderType = 'TAKEAWAY';
-    else orderType = 'ONLINE_DELIVERY';
+    if (typeRand < 0.65) orderType = 'DINE_IN';
+    else orderType = 'TAKEAWAY';
 
     // Calculate order total
     const numItems = Math.floor(Math.random() * 4) + 1; // 1-4 items

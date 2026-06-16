@@ -1,5 +1,4 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../config/database');
 
 // Get all menu items with optional category filter
 exports.getAllMenuItems = async (req, res) => {

@@ -1,6 +1,15 @@
-const { PrismaClient } = require('@prisma/client');
+const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
-const prisma = new PrismaClient();
+const {
+  getEmployeeLeaveBalance,
+  getAllEmployeeLeaveBalances,
+  validateLeaveRequest,
+} = require('../services/leaveBalance.service');
+const {
+  buildCheckInLocationData,
+  buildCheckOutLocationData,
+  getAttendanceLocationPolicy,
+} = require('../services/attendanceLocation.service');
 
 // Get all employees
 exports.getAllEmployees = async (req, res) => {
@@ -31,6 +40,7 @@ exports.getAllEmployees = async (req, res) => {
       return {
         ...rest,
         id: emp.userId, // Use userId as id for consistency
+        isActive: emp.isActive,
         fullName: employeeProfile?.fullName || 'N/A',
         contact: employeeProfile?.contact || null,
         phoneNumber: employeeProfile?.contact || null, // Alias for backward compatibility
@@ -90,6 +100,7 @@ exports.getEmployeeById = async (req, res) => {
     const sanitizedEmployee = {
       ...rest,
       id: employee.userId,
+      isActive: employee.isActive,
       fullName: employeeProfile?.fullName || 'N/A',
       contact: employeeProfile?.contact || null,
       phoneNumber: employeeProfile?.contact || null,
@@ -185,6 +196,7 @@ exports.createEmployee = async (req, res) => {
     const sanitizedEmployee = {
       ...rest,
       id: employee.userId,
+      isActive: employee.isActive,
       fullName: employeeProfile?.fullName || 'N/A',
       contact: employeeProfile?.contact || null,
       phoneNumber: employeeProfile?.contact || null,
@@ -286,6 +298,7 @@ exports.updateEmployee = async (req, res) => {
     const sanitizedEmployee = {
       ...rest,
       id: employee.userId,
+      isActive: employee.isActive,
       fullName: employeeProfile?.fullName || 'N/A',
       contact: employeeProfile?.contact || null,
       phoneNumber: employeeProfile?.contact || null,
@@ -320,13 +333,22 @@ exports.updateEmployee = async (req, res) => {
 };
 
 // Delete employee
-exports.deleteEmployee = async (req, res) => {
+exports.updateEmployeeStatus = async (req, res) => {
   try {
     const { id } = req.params;
+    const { isActive } = req.body;
+    const userId = parseInt(id, 10);
 
-    // Check if employee exists
+    if (typeof isActive !== 'boolean') {
+      return res.status(400).json({
+        success: false,
+        message: 'isActive must be a boolean value',
+      });
+    }
+
     const existingEmployee = await prisma.user.findUnique({
-      where: { userId: parseInt(id) },
+      where: { userId },
+      include: { employeeProfile: true },
     });
 
     if (!existingEmployee || existingEmployee.role === 'CUSTOMER') {
@@ -336,34 +358,54 @@ exports.deleteEmployee = async (req, res) => {
       });
     }
 
-    // Prevent deleting yourself (the authenticated admin)
-    if (req.user && req.user.userId === parseInt(id)) {
+    if (req.user && req.user.userId === userId) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot delete your own account',
+        message: 'Cannot change the status of your own account',
       });
     }
 
-    // Delete employee profile first, then user
-    if (existingEmployee.role !== 'CUSTOMER') {
-      await prisma.employeeProfile.deleteMany({
-        where: { userId: parseInt(id) },
-      });
-    }
-
-    await prisma.user.delete({
-      where: { userId: parseInt(id) },
+    const employee = await prisma.user.update({
+      where: { userId },
+      data: { isActive },
+      include: { employeeProfile: true },
     });
+
+    const { passwordHash, employeeProfile, ...rest } = employee;
+    const sanitizedEmployee = {
+      ...rest,
+      id: employee.userId,
+      isActive: employee.isActive,
+      fullName: employeeProfile?.fullName || 'N/A',
+      contact: employeeProfile?.contact || null,
+      phoneNumber: employeeProfile?.contact || null,
+      position: employeeProfile?.designation || 'N/A',
+      designation: employeeProfile?.designation || 'N/A',
+      salary: employeeProfile?.salary || 0,
+      joinDate: employeeProfile?.joinDate || null,
+      employeeId: employeeProfile?.employeeId || null,
+      isActive: employee.isActive,
+      employee: employeeProfile ? {
+        position: employeeProfile.designation,
+        designation: employeeProfile.designation,
+        salary: employeeProfile.salary,
+        fullName: employeeProfile.fullName,
+        contact: employeeProfile.contact,
+        phoneNumber: employeeProfile.contact,
+        joinDate: employeeProfile.joinDate,
+      } : null,
+    };
 
     res.json({
       success: true,
-      message: 'Employee deleted successfully',
+      message: isActive ? 'Employee reactivated successfully' : 'Employee deactivated successfully',
+      data: sanitizedEmployee,
     });
   } catch (error) {
-    console.error('Error deleting employee:', error);
+    console.error('Error updating employee status:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to delete employee',
+      message: 'Failed to update employee status',
       error: error.message,
     });
   }
@@ -376,15 +418,21 @@ exports.getEmployeeStats = async (req, res) => {
       where: { role: { not: 'CUSTOMER' } },
     });
 
-    const adminCount = await prisma.user.count({ where: { role: 'ADMIN' } });
-    const managerCount = await prisma.user.count({ where: { role: 'MANAGER' } });
-    const waiterCount = await prisma.user.count({ where: { role: 'WAITER' } });
-    const chefCount = await prisma.user.count({ where: { role: 'CHEF' } });
+    const activeEmployees = await prisma.user.count({
+      where: { role: { not: 'CUSTOMER' }, isActive: true },
+    });
+
+    const adminCount = await prisma.user.count({ where: { role: 'ADMIN', isActive: true } });
+    const managerCount = await prisma.user.count({ where: { role: 'MANAGER', isActive: true } });
+    const waiterCount = await prisma.user.count({ where: { role: 'WAITER', isActive: true } });
+    const chefCount = await prisma.user.count({ where: { role: 'CHEF', isActive: true } });
 
     res.json({
       success: true,
       data: {
         totalEmployees,
+        activeEmployees,
+        inactiveEmployees: totalEmployees - activeEmployees,
         byRole: {
           admin: adminCount,
           manager: managerCount,
@@ -466,19 +514,22 @@ exports.getEmployeeDashboard = async (req, res) => {
       workingHours = (checkOut - checkIn) / (1000 * 60 * 60); // Convert to hours
     }
 
-    // Get upcoming leave
-    const upcomingLeave = await prisma.leaveRequest.findFirst({
-      where: {
-        employeeId: employeeId,
-        status: 'APPROVED',
-        startDate: {
-          gte: new Date(),
+    // Get upcoming leave and current balance
+    const [upcomingLeave, leaveBalance] = await Promise.all([
+      prisma.leaveRequest.findFirst({
+        where: {
+          employeeId: employeeId,
+          status: 'APPROVED',
+          startDate: {
+            gte: new Date(),
+          },
         },
-      },
-      orderBy: {
-        startDate: 'asc',
-      },
-    });
+        orderBy: {
+          startDate: 'asc',
+        },
+      }),
+      getEmployeeLeaveBalance(employeeId),
+    ]);
 
     // Get recent activity (recent orders)
     const recentActivity = todayOrders.slice(0, 5).map(order => ({
@@ -504,6 +555,7 @@ exports.getEmployeeDashboard = async (req, res) => {
         },
         recentActivity,
         upcomingLeave,
+        leaveBalance,
       },
     });
   } catch (error) {
@@ -672,6 +724,7 @@ exports.getEmployeeAttendance = async (req, res) => {
           lateDays,
           totalWorkingHours: Math.round(totalWorkingHours * 10) / 10,
         },
+        locationPolicy: getAttendanceLocationPolicy(),
       },
     });
   } catch (error) {
@@ -745,12 +798,27 @@ exports.checkIn = async (req, res) => {
     
     const status = now > lateThreshold ? 'LATE' : 'PRESENT';
 
+    let locationData;
+    try {
+      locationData = buildCheckInLocationData(req.body);
+    } catch (locationError) {
+      return res.status(400).json({
+        success: false,
+        message: locationError.message,
+      });
+    }
+
     const attendance = existingAttendance
       ? await prisma.attendance.update({
           where: { attendanceId: existingAttendance.attendanceId },
           data: {
             checkInTime: now,
             status,
+            checkInLatitude: locationData.checkInLatitude,
+            checkInLongitude: locationData.checkInLongitude,
+            checkInAccuracyMeters: locationData.checkInAccuracyMeters,
+            checkInAtWorkplace: locationData.checkInAtWorkplace,
+            checkInDistanceMeters: locationData.checkInDistanceMeters,
           },
         })
       : await prisma.attendance.create({
@@ -759,6 +827,11 @@ exports.checkIn = async (req, res) => {
             date: today,
             checkInTime: now,
             status,
+            checkInLatitude: locationData.checkInLatitude,
+            checkInLongitude: locationData.checkInLongitude,
+            checkInAccuracyMeters: locationData.checkInAccuracyMeters,
+            checkInAtWorkplace: locationData.checkInAtWorkplace,
+            checkInDistanceMeters: locationData.checkInDistanceMeters,
           },
         });
 
@@ -766,6 +839,7 @@ exports.checkIn = async (req, res) => {
       success: true,
       message: 'Checked in successfully',
       data: attendance,
+      locationVerification: locationData.verification,
     });
   } catch (error) {
     console.error('Error checking in:', error);
@@ -819,10 +893,25 @@ exports.checkOut = async (req, res) => {
       });
     }
 
+    let locationData;
+    try {
+      locationData = buildCheckOutLocationData(req.body);
+    } catch (locationError) {
+      return res.status(400).json({
+        success: false,
+        message: locationError.message,
+      });
+    }
+
     const updatedAttendance = await prisma.attendance.update({
       where: { attendanceId: attendance.attendanceId },
       data: {
         checkOutTime: new Date(),
+        checkOutLatitude: locationData.checkOutLatitude,
+        checkOutLongitude: locationData.checkOutLongitude,
+        checkOutAccuracyMeters: locationData.checkOutAccuracyMeters,
+        checkOutAtWorkplace: locationData.checkOutAtWorkplace,
+        checkOutDistanceMeters: locationData.checkOutDistanceMeters,
       },
     });
 
@@ -830,6 +919,7 @@ exports.checkOut = async (req, res) => {
       success: true,
       message: 'Checked out successfully',
       data: updatedAttendance,
+      locationVerification: locationData.verification,
     });
   } catch (error) {
     console.error('Error checking out:', error);
@@ -935,17 +1025,75 @@ exports.getEmployeeSchedule = async (req, res) => {
   }
 };
 
+// Get employee leave balance
+exports.getEmployeeLeaveBalance = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const year = req.query.year ? parseInt(req.query.year, 10) : new Date().getFullYear();
+
+    const employee = await prisma.user.findUnique({
+      where: { userId },
+      include: { employeeProfile: true },
+    });
+
+    if (!employee?.employeeProfile) {
+      return res.status(404).json({
+        success: false,
+        message: 'Employee profile not found',
+      });
+    }
+
+    const balance = await getEmployeeLeaveBalance(employee.employeeProfile.employeeId, year);
+
+    res.json({
+      success: true,
+      data: balance,
+    });
+  } catch (error) {
+    console.error('Error fetching leave balance:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch leave balance',
+      error: error.message,
+    });
+  }
+};
+
+// Get all employee leave balances (Admin/Manager)
+exports.getAllEmployeeLeaveBalances = async (req, res) => {
+  try {
+    const year = req.query.year ? parseInt(req.query.year, 10) : new Date().getFullYear();
+    const balances = await getAllEmployeeLeaveBalances(year);
+
+    res.json({
+      success: true,
+      data: {
+        year,
+        employees: balances,
+      },
+    });
+  } catch (error) {
+    console.error('Error fetching employee leave balances:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch employee leave balances',
+      error: error.message,
+    });
+  }
+};
+
 // Get employee leave requests
 exports.getEmployeeLeaveRequests = async (req, res) => {
   try {
     const userId = req.user.userId;
+    const year = req.query.year ? parseInt(req.query.year, 10) : new Date().getFullYear();
     
     const employee = await prisma.user.findUnique({
       where: { userId },
       include: { employeeProfile: true },
     });
 
-    if (!employee || !employee.employeeProfile) {
+    if (!employee?.employeeProfile) {
       return res.status(404).json({
         success: false,
         message: 'Employee profile not found',
@@ -953,15 +1101,27 @@ exports.getEmployeeLeaveRequests = async (req, res) => {
     }
 
     const employeeId = employee.employeeProfile.employeeId;
-
-    const leaveRequests = await prisma.leaveRequest.findMany({
-      where: { employeeId: employeeId },
-      orderBy: { appliedAt: 'desc' },
-    });
+    const [leaveRequests, balance] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: {
+          employeeId,
+          startDate: {
+            gte: new Date(year, 0, 1),
+            lt: new Date(year + 1, 0, 1),
+          },
+        },
+        orderBy: { appliedAt: 'desc' },
+      }),
+      getEmployeeLeaveBalance(employeeId, year),
+    ]);
 
     res.json({
       success: true,
-      data: leaveRequests,
+      data: {
+        year,
+        leaveRequests,
+        balance,
+      },
     });
   } catch (error) {
     console.error('Error fetching leave requests:', error);
@@ -977,12 +1137,12 @@ exports.getEmployeeLeaveRequests = async (req, res) => {
 exports.createLeaveRequest = async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { startDate, endDate, reason } = req.body;
+    const { startDate, endDate, reason, leaveType } = req.body;
 
-    if (!startDate || !endDate || !reason) {
+    if (!startDate || !endDate || !reason || !leaveType) {
       return res.status(400).json({
         success: false,
-        message: 'Start date, end date, and reason are required',
+        message: 'Leave type, start date, end date, and reason are required',
       });
     }
 
@@ -991,7 +1151,7 @@ exports.createLeaveRequest = async (req, res) => {
       include: { employeeProfile: true },
     });
 
-    if (!employee || !employee.employeeProfile) {
+    if (!employee?.employeeProfile) {
       return res.status(404).json({
         success: false,
         message: 'Employee profile not found',
@@ -999,28 +1159,40 @@ exports.createLeaveRequest = async (req, res) => {
     }
 
     const employeeId = employee.employeeProfile.employeeId;
+    const validation = await validateLeaveRequest({
+      employeeId,
+      leaveType,
+      startDate,
+      endDate,
+    });
 
     const leaveRequest = await prisma.leaveRequest.create({
       data: {
-        employeeId: employeeId,
+        employeeId,
+        leaveType: validation.leaveType,
         startDate: new Date(startDate),
         endDate: new Date(endDate),
+        totalDays: validation.totalDays,
         reason,
         status: 'PENDING',
       },
     });
 
+    const balance = await getEmployeeLeaveBalance(employeeId, validation.year);
+
     res.status(201).json({
       success: true,
       message: 'Leave request submitted successfully',
-      data: leaveRequest,
+      data: {
+        leaveRequest,
+        balance,
+      },
     });
   } catch (error) {
     console.error('Error creating leave request:', error);
-    res.status(500).json({
+    res.status(error.message.includes('Insufficient') || error.message.includes('Invalid') ? 400 : 500).json({
       success: false,
-      message: 'Failed to create leave request',
-      error: error.message,
+      message: error.message || 'Failed to create leave request',
     });
   }
 };
@@ -1028,36 +1200,51 @@ exports.createLeaveRequest = async (req, res) => {
 // Get all leave requests (Admin/Manager only)
 exports.getAllLeaveRequests = async (req, res) => {
   try {
-    const leaveRequests = await prisma.leaveRequest.findMany({
-      include: {
-        employee: {
-          include: {
-            user: {
-              select: {
-                email: true,
+    const year = req.query.year ? parseInt(req.query.year, 10) : new Date().getFullYear();
+
+    const [leaveRequests, employeeBalances] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: {
+          startDate: {
+            gte: new Date(year, 0, 1),
+            lt: new Date(year + 1, 0, 1),
+          },
+        },
+        include: {
+          employee: {
+            include: {
+              user: {
+                select: {
+                  email: true,
+                },
               },
             },
           },
         },
-      },
-      orderBy: {
-        appliedAt: 'desc',
-      },
-    });
+        orderBy: {
+          appliedAt: 'desc',
+        },
+      }),
+      getAllEmployeeLeaveBalances(year),
+    ]);
 
-    // Format the response to include employee details
-    const formattedRequests = leaveRequests.map(request => ({
+    const formattedRequests = leaveRequests.map((request) => ({
       ...request,
       employee: {
         fullName: request.employee.fullName,
         email: request.employee.user.email,
         designation: request.employee.designation,
+        employeeId: request.employee.employeeId,
       },
     }));
 
     res.json({
       success: true,
-      data: formattedRequests,
+      data: {
+        year,
+        leaveRequests: formattedRequests,
+        employeeBalances,
+      },
     });
   } catch (error) {
     console.error('Error fetching all leave requests:', error);
@@ -1100,6 +1287,16 @@ exports.updateLeaveRequest = async (req, res) => {
       });
     }
 
+    if (status === 'APPROVED') {
+      await validateLeaveRequest({
+        employeeId: leaveRequest.employeeId,
+        leaveType: leaveRequest.leaveType,
+        startDate: leaveRequest.startDate,
+        endDate: leaveRequest.endDate,
+        excludeLeaveId: leaveRequest.leaveId,
+      });
+    }
+
     const updatedRequest = await prisma.leaveRequest.update({
       where: { leaveId: parseInt(id) },
       data: {
@@ -1126,10 +1323,9 @@ exports.updateLeaveRequest = async (req, res) => {
     });
   } catch (error) {
     console.error('Error updating leave request:', error);
-    res.status(500).json({
+    res.status(error.message.includes('Insufficient') ? 400 : 500).json({
       success: false,
-      message: 'Failed to update leave request',
-      error: error.message,
+      message: error.message || 'Failed to update leave request',
     });
   }
 };

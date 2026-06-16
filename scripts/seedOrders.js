@@ -80,7 +80,7 @@ async function seedOrders() {
     });
 
     // 4. Generate sample orders
-    const orderTypes = ['DINE_IN', 'TAKEAWAY', 'ONLINE_DELIVERY'];
+    const orderTypes = ['DINE_IN', 'TAKEAWAY'];
     const orderStatuses = ['PENDING', 'PREPARING', 'READY', 'SERVED', 'COMPLETED'];
     const numberOfOrders = 15; // Create 15 sample orders
 

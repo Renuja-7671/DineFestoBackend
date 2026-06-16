@@ -13,22 +13,28 @@ router.get('/dashboard', reportController.getDashboardStats);
 // Comprehensive dashboard overview
 router.get('/dashboard-overview', reportController.getDashboardOverview);
 
-// Revenue report
+// Revenue report (export route must be registered before /revenue if using param routes)
+router.get('/revenue/export', reportController.exportRevenueReportPdf);
 router.get('/revenue', reportController.getRevenueReport);
 
 // Sales report
+router.get('/sales/export', reportController.exportSalesReportPdf);
 router.get('/sales', reportController.getSalesReport);
 
 // Customer insights
+router.get('/customers/export', reportController.exportCustomerReportPdf);
 router.get('/customers', reportController.getCustomerInsights);
 
 // Inventory report
+router.get('/inventory/export', reportController.exportInventoryReportPdf);
 router.get('/inventory', reportController.getInventoryReport);
 
 // Employee performance
+router.get('/employees/export', reportController.exportEmployeeReportPdf);
 router.get('/employees', reportController.getEmployeePerformance);
 
 // Order trends
+router.get('/orders/export', reportController.exportOrderTrendsReportPdf);
 router.get('/orders', reportController.getOrderTrends);
 
 // Sales forecast

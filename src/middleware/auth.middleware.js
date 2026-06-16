@@ -23,6 +23,7 @@ const authenticate = async (req, res, next) => {
         userId: true,
         email: true,
         role: true,
+        isActive: true,
         customerProfile: true,
         employeeProfile: true,
       },
@@ -30,6 +31,10 @@ const authenticate = async (req, res, next) => {
 
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
+    }
+
+    if (user.role !== 'CUSTOMER' && user.isActive === false) {
+      return res.status(403).json({ error: 'Account deactivated. Contact an administrator.' });
     }
 
     req.user = user;

@@ -6,13 +6,16 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
+    "test": "jest --runInBand",
     "build": "prisma generate",
+    "postinstall": "prisma generate",
+    "vercel-build": "prisma generate",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:push": "prisma db push",
     "prisma:studio": "prisma studio",
     "prisma:seed": "node prisma/seed.js",
-    "forecast:train": "python3 forecasting/train_sales_forecast.py"
+    "forecast:train": ".venv-forecast/bin/python forecasting/train_sales_forecast.py"
   },
   "keywords": [
     "restaurant",
@@ -35,9 +38,11 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "nodemailer": "^7.0.12",
+    "pdfkit": "^0.19.1",
     "stripe": "^20.3.1"
   },
   "devDependencies": {
+    "jest": "^29.7.0",
     "nodemon": "^3.0.2",
     "prisma": "^5.22.0"
   }

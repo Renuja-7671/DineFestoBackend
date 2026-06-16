@@ -92,6 +92,10 @@ const login = async (req, res, next) => {
       return errorResponse(res, 'Invalid email or password', 401);
     }
 
+    if (user.role !== 'CUSTOMER' && user.isActive === false) {
+      return errorResponse(res, 'Account deactivated. Contact an administrator.', 403);
+    }
+
     // Generate token
     const token = generateToken(user.userId, user.role);
 

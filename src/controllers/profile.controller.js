@@ -1,6 +1,5 @@
-const { PrismaClient } = require('@prisma/client');
+const prisma = require('../config/database');
 const bcrypt = require('bcryptjs');
-const prisma = new PrismaClient();
 
 // Get current user profile
 exports.getProfile = async (req, res) => {

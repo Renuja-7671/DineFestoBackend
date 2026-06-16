@@ -1,5 +1,4 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+const prisma = require('../config/database');
 
 // Get all reviews with filters
 exports.getAllReviews = async (req, res) => {
@@ -322,40 +321,36 @@ exports.deleteReview = async (req, res) => {
 // Get review statistics
 exports.getReviewStats = async (req, res) => {
   try {
-    // Total reviews
-    const totalReviews = await prisma.review.count();
-
-    // Average rating
-    const reviews = await prisma.review.findMany({
-      select: {
-        rating: true,
-      },
-    });
-
-    const averageRating = reviews.length > 0
-      ? (reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length).toFixed(1)
-      : 0;
-
-    // Rating distribution
-    const ratingDistribution = await Promise.all([
-      prisma.review.count({ where: { rating: 5 } }),
-      prisma.review.count({ where: { rating: 4 } }),
-      prisma.review.count({ where: { rating: 3 } }),
-      prisma.review.count({ where: { rating: 2 } }),
-      prisma.review.count({ where: { rating: 1 } }),
-    ]);
-
-    // Recent reviews count (last 7 days)
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-    const recentReviews = await prisma.review.count({
-      where: {
-        createdAt: {
-          gte: sevenDaysAgo,
+    const [
+      totalReviews,
+      ratingAggregate,
+      ratingDistribution,
+      recentReviews,
+    ] = await Promise.all([
+      prisma.review.count(),
+      prisma.review.aggregate({ _avg: { rating: true } }),
+      Promise.all([
+        prisma.review.count({ where: { rating: 5 } }),
+        prisma.review.count({ where: { rating: 4 } }),
+        prisma.review.count({ where: { rating: 3 } }),
+        prisma.review.count({ where: { rating: 2 } }),
+        prisma.review.count({ where: { rating: 1 } }),
+      ]),
+      prisma.review.count({
+        where: {
+          createdAt: {
+            gte: sevenDaysAgo,
+          },
         },
-      },
-    });
+      }),
+    ]);
+
+    const averageRating = ratingAggregate._avg.rating
+      ? Number(ratingAggregate._avg.rating.toFixed(1))
+      : 0;
 
     res.status(200).json({
       success: true,
