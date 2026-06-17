@@ -85,6 +85,8 @@ const orderListInclude = {
         select: {
           itemId: true,
           name: true,
+          price: true,
+          imageUrl: true,
         },
       },
     },
@@ -102,6 +104,8 @@ const buildOrderWhereClause = (req) => {
     where.status = { in: ['PENDING', 'PREPARING', 'READY'] };
   } else if (statusGroup === 'COMPLETED') {
     where.status = { in: ['SERVED', 'COMPLETED'] };
+  } else if (statusGroup === 'HISTORY') {
+    where.status = { in: ['SERVED', 'COMPLETED', 'CANCELLED'] };
   } else if (status && status !== 'ALL') {
     where.status = status;
   }

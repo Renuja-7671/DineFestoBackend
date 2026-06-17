@@ -21,7 +21,7 @@ const authenticate = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Authentication required' });
+      return res.status(401).json({ error: 'Authentication required', message: 'Authentication required' });
     }
 
     const token = authHeader.substring(7);
@@ -41,21 +41,24 @@ const authenticate = async (req, res, next) => {
     });
 
     if (!user) {
-      return res.status(401).json({ error: 'User not found' });
+      return res.status(401).json({ error: 'User not found', message: 'User not found' });
     }
 
     if (user.role !== 'CUSTOMER' && user.isActive === false) {
-      return res.status(403).json({ error: 'Account deactivated. Contact an administrator.' });
+      return res.status(403).json({
+        error: 'Account deactivated. Contact an administrator.',
+        message: 'Account deactivated. Contact an administrator.',
+      });
     }
 
     req.user = user;
     next();
   } catch (error) {
     if (error.name === 'JsonWebTokenError') {
-      return res.status(401).json({ error: 'Invalid token' });
+      return res.status(401).json({ error: 'Invalid token', message: 'Invalid token' });
     }
     if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Token expired' });
+      return res.status(401).json({ error: 'Token expired', message: 'Token expired' });
     }
     next(error);
   }
